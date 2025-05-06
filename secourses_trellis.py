@@ -844,6 +844,20 @@ def run_batch_processing(
                 print(error_msg)
                 import traceback
                 traceback.print_exc()
+
+                log_output.append(f"Attempting to re-initialize pipeline after error on {current_output_prefix}.")
+                print(f"Attempting to re-initialize pipeline after error on {current_output_prefix}.")
+                try:
+                    initialize_pipeline(cmd_args.precision) # cmd_args is in global scope
+                    log_output.append(f"Pipeline re-initialization attempt for {current_output_prefix} completed.")
+                    print(f"Pipeline re-initialization attempt for {current_output_prefix} completed.")
+                except Exception as reinit_e:
+                    reinit_error_msg = f"CRITICAL: Failed to re-initialize pipeline after error on {current_output_prefix}: {str(reinit_e)}"
+                    log_output.append(reinit_error_msg)
+                    print(reinit_error_msg)
+                    log_output.append("Stopping batch processing as pipeline re-initialization failed.")
+                    print("Stopping batch processing as pipeline re-initialization failed.")
+                    break # Stop the batch if we can't even re-init the pipeline
         
         if CANCEL_REQUESTED: # Check after inner loop too, to break outer file loop
             break
@@ -861,7 +875,7 @@ def run_batch_processing(
 # Gradio UI
 with gr.Blocks(theme=gr.themes.Soft(), delete_cache=(600, 600)) as demo:
     gr.Markdown("""
-    ## Image to 3D Asset with TRELLIS SECourses App (forked from trellis-stable-projectorz) V6 > https://www.patreon.com/posts/117470976
+    ## Image to 3D Asset with TRELLIS SECourses App (forked from trellis-stable-projectorz) V7 > https://www.patreon.com/posts/117470976
     """.format(code_version))
     
     seed_val = gr.State()
