@@ -337,6 +337,11 @@ def extract_glb(
     # user_dir = os.path.join(TMP_DIR, str(req.session_hash)) # Not used
     gs, mesh = unpack_state(state)
     
+    # Display vertex and triangle counts in command line
+    vertex_count = mesh.vertices.shape[0]
+    face_count = mesh.faces.shape[0]
+    print(f"Mesh stats - Vertices: {vertex_count}, Triangles: {face_count}")
+    
     actual_glb_path = ""
     glb_filename_base = ""
 
@@ -357,8 +362,16 @@ def extract_glb(
     if save_metadata and glb_filename_base: # If metadata is to be extended or created here
         metadata_path_check = os.path.join(OUTPUT_METADATA_DIR, f"{glb_filename_base}.txt")
         # Example: append to existing metadata or create new if needed
-        # For now, just acknowledging it could be done here
-        pass
+        if os.path.exists(metadata_path_check):
+            try:
+                with open(metadata_path_check, 'r') as f:
+                    metadata = json.load(f)
+                metadata["vertex_count"] = int(vertex_count)
+                metadata["triangle_count"] = int(face_count)
+                with open(metadata_path_check, 'w') as f:
+                    json.dump(metadata, f, indent=4)
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"Warning: Could not update metadata with mesh stats: {e}")
 
     torch.cuda.empty_cache()
     return actual_glb_path, actual_glb_path
@@ -460,10 +473,10 @@ UI_COMPONENT_KEYS = [
 def get_default_config_values():
     return {
         "seed_val": 0, "randomize_seed_val": True,
-        "ss_guidance_strength_val": 7.5, "ss_sampling_steps_val": 12,
-        "slat_guidance_strength_val": 3.0, "slat_sampling_steps_val": 12,
+        "ss_guidance_strength_val": 7.5, "ss_sampling_steps_val": 20,
+        "slat_guidance_strength_val": 3.0, "slat_sampling_steps_val": 20,
         "multiimage_algo_val": "stochastic",
-        "mesh_simplify_val": 0.99,
+        "mesh_simplify_val": 0.7,
         "texture_size_val": 1024,
         "video_resolution_val": 1024, "video_num_frames_val": 240, "video_fps_val": 30,
         "save_metadata_val": True,
@@ -680,6 +693,7 @@ def run_batch_processing(
             if extract_glb_cb:
                 glb_path, _ = extract_glb(generated_state, mesh_simplify_val, texture_size_val, save_metadata_val, output_filename_prefix=input_basename)
                 log_output.append(f"  Extracted GLB: {glb_path}")
+                # Mesh stats are already printed by extract_glb function
             
             if extract_gs_cb:
                 gs_path, _ = extract_gaussian(generated_state, save_metadata_val, output_filename_prefix=input_basename)
@@ -711,7 +725,7 @@ def run_batch_processing(
 # Added theme=gr.themes.Soft() for a modern look
 with gr.Blocks(theme=gr.themes.Soft(), delete_cache=(600, 600)) as demo:
     gr.Markdown("""
-    ## Image to 3D Asset with TRELLIS SECourses App (forked from trellis-stable-projectorz) V1 > https://www.patreon.com/posts/117470976
+    ## Image to 3D Asset with TRELLIS SECourses App (forked from trellis-stable-projectorz) V2 > https://www.patreon.com/posts/117470976
     """.format(code_version))
     
     # UI Component Values (will be populated by load_config)
@@ -738,12 +752,13 @@ with gr.Blocks(theme=gr.themes.Soft(), delete_cache=(600, 600)) as demo:
 
 
     with gr.Row():
-        with gr.Column(scale=2): # Input settings column
+        with gr.Column(scale=1): # Input settings column
             with gr.Tabs() as input_tabs:
                 with gr.Tab(label="Single Image", id=0) as single_image_input_tab:
-                    image_prompt = gr.Image(label="Image Prompt", image_mode="RGBA", type="pil", height=300)
+                    image_prompt = gr.Image(label="Image Prompt", image_mode="RGBA", type="pil", height=512)
+                generate_btn = gr.Button("Generate", variant="primary")
                 with gr.Tab(label="Multiple Images", id=1) as multiimage_input_tab:
-                    multiimage_prompt = gr.Gallery(label="Image Prompt", type="pil", height=300, columns=3)
+                    multiimage_prompt = gr.Gallery(label="Image Prompt", type="pil", height=512, columns=3)
                     gr.Markdown("""
                         Input different views of the object in separate images. 
                         *NOTE: this is an experimental algorithm. It may not produce the best results for all images.*
@@ -765,23 +780,20 @@ with gr.Blocks(theme=gr.themes.Soft(), delete_cache=(600, 600)) as demo:
                 multiimage_algo_radio = gr.Radio(["stochastic", "multidiffusion"], label="Multi-image Algorithm", value="stochastic", elem_id="multiimage_algo_radio_elem")
 
             with gr.Accordion(label="Video Output Settings", open=True):
-                video_resolution_slider = gr.Slider(256, 2048, label="Video Resolution (pixels)", value=1024, step=64, info="Width of the output video frames.", elem_id="video_resolution_slider_elem")
-                video_num_frames_slider = gr.Slider(30, 480, label="Video Number of Frames", value=240, step=10, info="Total frames in the rotating showcase video.", elem_id="video_num_frames_slider_elem")
-                video_fps_slider = gr.Slider(10, 120, label="Video FPS", value=60, step=1, info="Frames per second for the output video.", elem_id="video_fps_slider_elem")
+                with gr.Row():
+                    video_resolution_slider = gr.Slider(256, 2048, label="Video Resolution (pixels)", value=1024, step=64, info="Width of the output video frames.", elem_id="video_resolution_slider_elem")
+                    video_num_frames_slider = gr.Slider(30, 480, label="Video Number of Frames", value=240, step=10, info="Total frames in the rotating showcase video.", elem_id="video_num_frames_slider_elem")
+                    video_fps_slider = gr.Slider(10, 120, label="Video FPS", value=60, step=1, info="Frames per second for the output video.", elem_id="video_fps_slider_elem")
 
-            generate_btn = gr.Button("Generate", variant="primary")
+            
             
             with gr.Accordion(label="Extraction & Metadata Settings", open=True):
                 mesh_simplify_slider = gr.Slider(0.2, 0.99, label="Mesh Simplification Factor", value=0.7, step=0.01, 
-                                          info="Lower values simplify more (less detail, smaller file). E.g., 0.2=heavy, 0.99=light.", elem_id="mesh_simplify_slider_elem")
+                                          info="If you make this lower, it will generate a bigger size Vertices + Triangles mesh file.", elem_id="mesh_simplify_slider_elem")
                 texture_size_slider = gr.Slider(512, 2048, label="Texture Size (pixels)", value=1024, step=512, 
                                          info="Resolution of baked texture (e.g., 1024x1024). Higher=sharper but larger GLB.", elem_id="texture_size_slider_elem")
                 save_metadata_checkbox = gr.Checkbox(label="Save Generation Metadata (.txt file)", value=True, 
                                                 info="Saves parameters and duration to a text file alongside outputs.", elem_id="save_metadata_checkbox_elem")
-
-            with gr.Row():
-                extract_glb_btn = gr.Button("Extract GLB", interactive=False)
-                extract_gs_btn = gr.Button("Extract Gaussian Splats", interactive=False) # Renamed for clarity
             
             gr.Markdown("""
                         *NOTE: Gaussian Splat file (.ply) can be very large (~50MB), it may take a while to display and download.*
@@ -789,11 +801,42 @@ with gr.Blocks(theme=gr.themes.Soft(), delete_cache=(600, 600)) as demo:
             with gr.Row():
                 open_outputs_btn = gr.Button("Open Outputs Folder")
                 open_batch_outputs_btn = gr.Button("Open Batch Outputs Folder")
+            # --- Example Images ---
+            # Removed run_on_click=True
+            with gr.Row() as single_image_example_row:
+                gr.Examples(
+                    examples=[
+                        f'assets/example_image/{image_file}' # Corrected path
+                        for image_file in os.listdir("assets/example_image") if image_file.lower().endswith(('.png', '.jpg', '.jpeg'))
+                    ],
+                    inputs=[image_prompt],
+                    fn=preprocess_image, # Preprocessing function for examples
+                    outputs=[image_prompt], # Output to the image_prompt component
+                    #cache_examples=True # Optional: caches preprocessed examples
+                    label="Single Image Examples",
+                    examples_per_page=80,
+                )
+            with gr.Row(visible=False) as multiimage_example_row:
+                gr.Examples(
+                    examples=prepare_multi_example(),
+                    inputs=[image_prompt], # This input is a bit awkward for multi-image examples that are already processed.
+                                           # The target for multi-image examples is multiimage_prompt (Gallery).
+                                           # This needs specific handling or direct Gallery update.
+                                           # For simplicity, let's assume split_image is used if one combined image is clicked.
+                    fn=split_image, # Function to split the example image (if it's a combined one)
+                    outputs=[multiimage_prompt], # Output to the gallery
+                    #cache_examples=True,
+                    label="Multi Image Examples (Click to split and load)",
+                    examples_per_page=40,
+                )
 
 
         with gr.Column(scale=1): # Output and controls column
-            video_output = gr.Video(label="Generated 3D Asset (Video)", autoplay=True, loop=True, height=300)
-            model_output = LitModel3D(label="Extracted GLB/Gaussian", exposure=10.0, height=300)
+            video_output = gr.Video(label="Generated 3D Asset (Video)", autoplay=True, loop=True, height=512)
+            with gr.Row():
+                extract_glb_btn = gr.Button("Extract GLB", interactive=False)
+                extract_gs_btn = gr.Button("Extract Gaussian Splats", interactive=False) # Renamed for clarity
+            model_output = LitModel3D(label="Extracted GLB/Gaussian", exposure=10.0, height=512)
             
             with gr.Row():
                 download_glb = gr.DownloadButton(label="Download GLB", interactive=False)
@@ -807,7 +850,7 @@ with gr.Blocks(theme=gr.themes.Soft(), delete_cache=(600, 600)) as demo:
                     config_save_name_textbox = gr.Textbox(label="Save Preset As", placeholder="Enter preset name")
                     config_save_button = gr.Button("Save Preset")
             
-            with gr.Accordion("Batch Processing", open=False):
+            with gr.Accordion("Batch Processing", open=True):
                 batch_input_folder_textbox = gr.Textbox(label="Input Folder (contains images)", placeholder="/path/to/input_images", info="Folder with images to process.", elem_id="batch_input_folder_textbox_elem")
                 batch_output_folder_textbox = gr.Textbox(label="Base Output Folder Name", value=BATCH_OUTPUT_DIR_BASE_DEFAULT, info="A folder with this name will be created in the main directory.", elem_id="batch_output_folder_textbox_elem")
                 batch_skip_existing_checkbox = gr.Checkbox(label="Skip if all outputs exist for an image", value=True, elem_id="batch_skip_existing_checkbox_elem")
@@ -822,34 +865,7 @@ with gr.Blocks(theme=gr.themes.Soft(), delete_cache=(600, 600)) as demo:
     is_multiimage = gr.State(False)
     output_buf = gr.State() # Stores the packed Gaussian/Mesh state
 
-    # --- Example Images ---
-    # Removed run_on_click=True
-    with gr.Row() as single_image_example_row:
-        gr.Examples(
-            examples=[
-                f'assets/example_image/{image_file}' # Corrected path
-                for image_file in os.listdir("assets/example_image") if image_file.lower().endswith(('.png', '.jpg', '.jpeg'))
-            ],
-            inputs=[image_prompt],
-            fn=preprocess_image, # Preprocessing function for examples
-            outputs=[image_prompt], # Output to the image_prompt component
-            #cache_examples=True # Optional: caches preprocessed examples
-            label="Single Image Examples",
-            examples_per_page=8,
-        )
-    with gr.Row(visible=False) as multiimage_example_row:
-        gr.Examples(
-            examples=prepare_multi_example(),
-            inputs=[image_prompt], # This input is a bit awkward for multi-image examples that are already processed.
-                                   # The target for multi-image examples is multiimage_prompt (Gallery).
-                                   # This needs specific handling or direct Gallery update.
-                                   # For simplicity, let's assume split_image is used if one combined image is clicked.
-            fn=split_image, # Function to split the example image (if it's a combined one)
-            outputs=[multiimage_prompt], # Output to the gallery
-            #cache_examples=True,
-            label="Multi Image Examples (Click to split and load)",
-            examples_per_page=4,
-        )
+
 
     # --- UI Component List for Presets ---
     # IMPORTANT: Order must match get_default_config_values, save_config, load_config
