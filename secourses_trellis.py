@@ -256,7 +256,7 @@ def image_to_3d(
         )
     else:
         outputs = pipeline.run_multi_image(
-            [img[0] for img in multiimages], # Ensure it's a list of PIL Images
+            [image[0] for image in multiimages], # Ensure it's a list of PIL Images
             seed=seed,
             formats=["gaussian", "mesh"],
             preprocess_image=False, # Assuming preprocessed
@@ -293,6 +293,8 @@ def image_to_3d(
         remove_temp_reservation_file(temp_reservation_path)
         
     state = pack_state(outputs['gaussian'][0], outputs['mesh'][0])
+    # Store the filename base in the state dict
+    state['filename_base'] = video_filename_base
     
     generation_duration = time.time() - start_time
 
@@ -350,8 +352,13 @@ def extract_glb(
         actual_glb_path = os.path.join(OUTPUT_GLB_DIR, f"{glb_filename_base}.glb")
         os.makedirs(os.path.dirname(actual_glb_path), exist_ok=True)
         temp_reservation_path = None
-    else: # Single mode
-        actual_glb_path, temp_reservation_path, glb_filename_base = get_next_output_path_numeric(OUTPUT_GLB_DIR, "glb")
+    else: # Single mode - use filename from state instead of generating new one
+        glb_filename_base = state.get('filename_base', '')
+        if not glb_filename_base:  # Fallback if for some reason the filename is missing
+            actual_glb_path, temp_reservation_path, glb_filename_base = get_next_output_path_numeric(OUTPUT_GLB_DIR, "glb")
+        else:
+            actual_glb_path = os.path.join(OUTPUT_GLB_DIR, f"{glb_filename_base}.glb")
+            temp_reservation_path = None
 
     glb_data = postprocessing_utils.to_glb(gs, mesh, simplify=mesh_simplify, texture_size=texture_size, verbose=False)
     glb_data.export(actual_glb_path)
@@ -395,8 +402,13 @@ def extract_gaussian(
         actual_gaussian_path = os.path.join(OUTPUT_GAUSSIAN_DIR, f"{gs_filename_base}.ply")
         os.makedirs(os.path.dirname(actual_gaussian_path), exist_ok=True)
         temp_reservation_path = None
-    else: # Single mode
-        actual_gaussian_path, temp_reservation_path, gs_filename_base = get_next_output_path_numeric(OUTPUT_GAUSSIAN_DIR, "ply")
+    else: # Single mode - use filename from state instead of generating new one
+        gs_filename_base = state.get('filename_base', '')
+        if not gs_filename_base:  # Fallback if for some reason the filename is missing
+            actual_gaussian_path, temp_reservation_path, gs_filename_base = get_next_output_path_numeric(OUTPUT_GAUSSIAN_DIR, "ply")
+        else:
+            actual_gaussian_path = os.path.join(OUTPUT_GAUSSIAN_DIR, f"{gs_filename_base}.ply")
+            temp_reservation_path = None
 
     gs.save_ply(actual_gaussian_path)
 
@@ -425,41 +437,18 @@ def prepare_multi_example() -> List[Image.Image]:
 
 
 def split_image(image: Image.Image) -> List[Image.Image]:
-    image_np = np.array(image) # Use a different variable name
-    # Check if alpha channel exists and has variance
-    if image_np.shape[2] < 4 or np.all(image_np[..., 3] == image_np[0,0,3]): # No alpha or uniform alpha
-         # If no usable alpha, assume 3 equal splits or return as is if not divisible
-        width = image_np.shape[1]
-        if width % 3 == 0:
-            split_width = width // 3
-            images = [
-                Image.fromarray(image_np[:, :split_width]),
-                Image.fromarray(image_np[:, split_width:2*split_width]),
-                Image.fromarray(image_np[:, 2*split_width:]),
-            ]
-        else: # Cannot split into 3, return as single image (or handle error)
-            images = [Image.fromarray(image_np)] 
-    else: # Original alpha splitting logic
-        alpha = image_np[..., 3]
-        alpha_mask = np.any(alpha > 0, axis=0) # Mask where alpha is present along columns
-        
-        # Find transitions from no-alpha to alpha (starts) and alpha to no-alpha (ends)
-        # Pad with False at ends to correctly detect transitions at edges
-        padded_mask = np.concatenate(([False], alpha_mask, [False]))
-        transitions = np.diff(padded_mask.astype(np.int8))
-        
-        start_pos = np.where(transitions == 1)[0].tolist()
-        end_pos = (np.where(transitions == -1)[0] -1).tolist() # Adjust end_pos due to diff
-
-        images = []
-        for s, e in zip(start_pos, end_pos):
-            if e > s : # Ensure valid slice
-                 images.append(Image.fromarray(image_np[:, s:e+1]))
-    
-    if not images: # Fallback if splitting fails
-        return [preprocess_image(Image.fromarray(image_np))]
-
-    return [preprocess_image(img) for img in images]
+    """
+    Split an image into multiple views.
+    """
+    image = np.array(image)
+    alpha = image[..., 3]
+    alpha = np.any(alpha>0, axis=0)
+    start_pos = np.where(~alpha[:-1] & alpha[1:])[0].tolist()
+    end_pos = np.where(alpha[:-1] & ~alpha[1:])[0].tolist()
+    images = []
+    for s, e in zip(start_pos, end_pos):
+        images.append(Image.fromarray(image[:, s:e+1]))
+    return [preprocess_image(image) for image in images]
 
 
 # --- Preset Functions ---
@@ -725,7 +714,7 @@ def run_batch_processing(
 # Added theme=gr.themes.Soft() for a modern look
 with gr.Blocks(theme=gr.themes.Soft(), delete_cache=(600, 600)) as demo:
     gr.Markdown("""
-    ## Image to 3D Asset with TRELLIS SECourses App (forked from trellis-stable-projectorz) V2 > https://www.patreon.com/posts/117470976
+    ## Image to 3D Asset with TRELLIS SECourses App (forked from trellis-stable-projectorz) V3 > https://www.patreon.com/posts/117470976
     """.format(code_version))
     
     # UI Component Values (will be populated by load_config)
@@ -756,9 +745,13 @@ with gr.Blocks(theme=gr.themes.Soft(), delete_cache=(600, 600)) as demo:
             with gr.Tabs() as input_tabs:
                 with gr.Tab(label="Single Image", id=0) as single_image_input_tab:
                     image_prompt = gr.Image(label="Image Prompt", image_mode="RGBA", type="pil", height=512)
-                generate_btn = gr.Button("Generate", variant="primary")
+                
+                with gr.Row():
+                    generate_btn = gr.Button("Generate", variant="primary")
+                    generate_and_extract_btn = gr.Button("Generate and Extract", variant="primary")
+                
                 with gr.Tab(label="Multiple Images", id=1) as multiimage_input_tab:
-                    multiimage_prompt = gr.Gallery(label="Image Prompt", type="pil", height=512, columns=3)
+                    multiimage_prompt = gr.Gallery(label="Image Prompt", format="png", type="pil", height=512, columns=3)
                     gr.Markdown("""
                         Input different views of the object in separate images. 
                         *NOTE: this is an experimental algorithm. It may not produce the best results for all images.*
@@ -802,33 +795,35 @@ with gr.Blocks(theme=gr.themes.Soft(), delete_cache=(600, 600)) as demo:
                 open_outputs_btn = gr.Button("Open Outputs Folder")
                 open_batch_outputs_btn = gr.Button("Open Batch Outputs Folder")
             # --- Example Images ---
-            # Removed run_on_click=True
             with gr.Row() as single_image_example_row:
                 gr.Examples(
                     examples=[
-                        f'assets/example_image/{image_file}' # Corrected path
+                        f'assets/example_image/{image_file}' 
                         for image_file in os.listdir("assets/example_image") if image_file.lower().endswith(('.png', '.jpg', '.jpeg'))
                     ],
                     inputs=[image_prompt],
-                    fn=preprocess_image, # Preprocessing function for examples
-                    outputs=[image_prompt], # Output to the image_prompt component
-                    #cache_examples=True # Optional: caches preprocessed examples
+                    fn=preprocess_image, 
+                    outputs=[image_prompt], 
                     label="Single Image Examples",
                     examples_per_page=80,
+                    run_on_click=True,
                 )
             with gr.Row(visible=False) as multiimage_example_row:
                 gr.Examples(
                     examples=prepare_multi_example(),
-                    inputs=[image_prompt], # This input is a bit awkward for multi-image examples that are already processed.
-                                           # The target for multi-image examples is multiimage_prompt (Gallery).
-                                           # This needs specific handling or direct Gallery update.
-                                           # For simplicity, let's assume split_image is used if one combined image is clicked.
-                    fn=split_image, # Function to split the example image (if it's a combined one)
-                    outputs=[multiimage_prompt], # Output to the gallery
-                    #cache_examples=True,
-                    label="Multi Image Examples (Click to split and load)",
+                    inputs=[image_prompt],
+                    fn=split_image,
+                    outputs=[multiimage_prompt],
+                    label="Multi Image Examples",
                     examples_per_page=40,
+                    run_on_click=True,
                 )
+                
+                # Instructions for multi-image
+                gr.Markdown("""
+                    Click an example above to load multiple views of an object.
+                    The combined image will be automatically split into separate views.
+                """)
 
 
         with gr.Column(scale=1): # Output and controls column
@@ -893,6 +888,7 @@ with gr.Blocks(theme=gr.themes.Soft(), delete_cache=(600, 600)) as demo:
     # demo.load(start_session) # Removed
     # demo.unload(end_session) # Removed
     
+    # Tab selection changes examples visibility
     single_image_input_tab.select(
         lambda: (False, gr.update(visible=True), gr.update(visible=False)),
         outputs=[is_multiimage, single_image_example_row, multiimage_example_row]
