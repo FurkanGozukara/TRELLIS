@@ -1,4 +1,3 @@
-
 import os
 import sys
 sys.path.append(os.getcwd())
@@ -218,6 +217,7 @@ def image_to_3d(
     video_fps: int,
     save_metadata: bool,
     output_filename_prefix: Optional[str] = None,
+    custom_output_dirs: Optional[dict] = None, # Added parameter for custom directories
 ) -> Tuple[dict, str]:
     
     start_time = time.time()
@@ -263,16 +263,20 @@ def image_to_3d(
     video_filename_base_final = "" # This will be stored in state
     temp_reservation_path = None
 
+    # Use custom directories if provided (for batch processing)
+    video_dir = custom_output_dirs['video'] if custom_output_dirs else OUTPUT_VIDEO_DIR
+    metadata_dir = custom_output_dirs['metadata'] if custom_output_dirs else OUTPUT_METADATA_DIR
+
     if output_filename_prefix: 
         video_filename_base_final = output_filename_prefix
-        actual_video_path = os.path.join(OUTPUT_VIDEO_DIR, f"{video_filename_base_final}.mp4")
+        actual_video_path = os.path.join(video_dir, f"{video_filename_base_final}.mp4")
         # Ensure directory for batch subfolder exists (if prefix contains path separators, common in batch)
         os.makedirs(os.path.dirname(actual_video_path), exist_ok=True) 
     else: 
         # For single generations (1 or N), get_next_output_path_numeric provides the base NNNN
         # Any iteration suffix (like _0001) should have been incorporated into output_filename_prefix by the caller if N > 1.
         # If output_filename_prefix is None, it means it's a single (1-shot) generation.
-        actual_video_path, temp_reservation_path, video_filename_base_final = get_next_output_path_numeric(OUTPUT_VIDEO_DIR, "mp4")
+        actual_video_path, temp_reservation_path, video_filename_base_final = get_next_output_path_numeric(video_dir, "mp4")
 
     imageio.mimsave(actual_video_path, combined_video_frames, fps=video_fps)
     if temp_reservation_path: # Only exists if get_next_output_path_numeric was called (i.e. not batch/N-gen with prefix)
@@ -280,6 +284,9 @@ def image_to_3d(
         
     state = pack_state(outputs['gaussian'][0], outputs['mesh'][0])
     state['filename_base'] = video_filename_base_final # This base now includes any N-gen iter suffixes
+    # Store custom output dirs in state for extraction functions
+    if custom_output_dirs:
+        state['custom_output_dirs'] = custom_output_dirs
     
     generation_duration = time.time() - start_time
 
@@ -303,7 +310,7 @@ def image_to_3d(
             "output_filename_base": video_filename_base_final,
         }
         
-        metadata_path = os.path.join(OUTPUT_METADATA_DIR, f"{video_filename_base_final}.txt")
+        metadata_path = os.path.join(metadata_dir, f"{video_filename_base_final}.txt")
         os.makedirs(os.path.dirname(metadata_path), exist_ok=True) # Ensure subfolder for batch
         with open(metadata_path, 'w') as f:
             json.dump(metadata, f, indent=4)
@@ -325,16 +332,21 @@ def extract_glb(
     face_count = mesh.faces.shape[0]
     print(f"Mesh stats - Vertices: {vertex_count}, Triangles: {face_count}")
     
+    # Get custom output dirs if provided (for batch processing)
+    custom_output_dirs = state.get('custom_output_dirs', None)
+    glb_dir = custom_output_dirs['glb'] if custom_output_dirs else OUTPUT_GLB_DIR
+    metadata_dir = custom_output_dirs['metadata'] if custom_output_dirs else OUTPUT_METADATA_DIR
+    
     # GLB filename is derived from the state, which already includes any iteration suffixes
     glb_filename_base = state.get('filename_base', '')
     if not glb_filename_base: # Fallback, should ideally not happen
         # This fallback would generate a new NNNN, not related to the video's NNNN.
         # It's better to error or ensure filename_base is always in state.
         print("Error: filename_base not found in state for GLB extraction. Generating new name.")
-        _, _, glb_filename_base = get_next_output_path_numeric(OUTPUT_GLB_DIR, "glb")
+        _, _, glb_filename_base = get_next_output_path_numeric(glb_dir, "glb")
         # No temp_reservation_path to clean here as it's a fallback.
 
-    actual_glb_path = os.path.join(OUTPUT_GLB_DIR, f"{glb_filename_base}.glb")
+    actual_glb_path = os.path.join(glb_dir, f"{glb_filename_base}.glb")
     os.makedirs(os.path.dirname(actual_glb_path), exist_ok=True) # For batch subfolders
 
     glb_data = postprocessing_utils.to_glb(gs, mesh, simplify=mesh_simplify, texture_size=texture_size, verbose=False)
@@ -343,7 +355,7 @@ def extract_glb(
     # No temp_reservation_path to remove here as it's based on state['filename_base']
 
     if save_metadata and glb_filename_base: 
-        metadata_path_check = os.path.join(OUTPUT_METADATA_DIR, f"{glb_filename_base}.txt")
+        metadata_path_check = os.path.join(metadata_dir, f"{glb_filename_base}.txt")
         if os.path.exists(metadata_path_check):
             try:
                 with open(metadata_path_check, 'r') as f:
@@ -371,12 +383,16 @@ def extract_gaussian(
 ) -> Tuple[str, str]:
     gs, _ = unpack_state(state)
     
+    # Get custom output dirs if provided (for batch processing)
+    custom_output_dirs = state.get('custom_output_dirs', None)
+    gs_dir = custom_output_dirs['gaussian'] if custom_output_dirs else OUTPUT_GAUSSIAN_DIR
+    
     gs_filename_base = state.get('filename_base', '')
     if not gs_filename_base: 
         print("Error: filename_base not found in state for Gaussian extraction. Generating new name.")
-        _, _, gs_filename_base = get_next_output_path_numeric(OUTPUT_GAUSSIAN_DIR, "ply")
+        _, _, gs_filename_base = get_next_output_path_numeric(gs_dir, "ply")
 
-    actual_gaussian_path = os.path.join(OUTPUT_GAUSSIAN_DIR, f"{gs_filename_base}.ply")
+    actual_gaussian_path = os.path.join(gs_dir, f"{gs_filename_base}.ply")
     os.makedirs(os.path.dirname(actual_gaussian_path), exist_ok=True) # For batch subfolders
 
     gs.save_ply(actual_gaussian_path)
@@ -713,6 +729,15 @@ def run_batch_processing(
     batch_glb_out_dir = os.path.join(batch_output_dir_specific, "glb")
     batch_gs_out_dir = os.path.join(batch_output_dir_specific, "gaussian")
     batch_meta_out_dir = os.path.join(batch_output_dir_specific, "metadata")
+    
+    # Create a dictionary with custom output directories for batch processing
+    custom_output_dirs = {
+        'video': batch_video_out_dir,
+        'glb': batch_glb_out_dir,
+        'gaussian': batch_gs_out_dir,
+        'metadata': batch_meta_out_dir
+    }
+    
     for d_path in [batch_output_dir_specific, batch_video_out_dir, batch_glb_out_dir, batch_gs_out_dir, batch_meta_out_dir]:
         os.makedirs(d_path, exist_ok=True)
 
@@ -791,7 +816,8 @@ def run_batch_processing(
                     multiimage_algo_val,
                     video_resolution_val, video_num_frames_val, video_fps_val,
                     save_metadata_val,
-                    output_filename_prefix=current_output_prefix 
+                    output_filename_prefix=current_output_prefix,
+                    custom_output_dirs=custom_output_dirs  # Pass the custom directories
                 )
                 log_output.append(f"  Generated video: {video_out_path}")
 
@@ -835,7 +861,7 @@ def run_batch_processing(
 # Gradio UI
 with gr.Blocks(theme=gr.themes.Soft(), delete_cache=(600, 600)) as demo:
     gr.Markdown("""
-    ## Image to 3D Asset with TRELLIS SECourses App (forked from trellis-stable-projectorz) V4 > https://www.patreon.com/posts/117470976
+    ## Image to 3D Asset with TRELLIS SECourses App (forked from trellis-stable-projectorz) V5 > https://www.patreon.com/posts/117470976
     """.format(code_version))
     
     seed_val = gr.State()
