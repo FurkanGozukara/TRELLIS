@@ -12,6 +12,7 @@ parser.add_argument("--precision",
                     help="Set precision: fp32 (full) or fp16 (half). Default: fp32")
 parser.add_argument("--xformers", action="store_true", help="Prefer xformers attention backend if available.")
 parser.add_argument("--share", action="store_true", help="Enable Gradio live share.")
+parser.add_argument("--highvram", action="store_true", help="Keep all models in GPU memory without CPU offloading.")
 cmd_args = parser.parse_args()
 
 # Attention Backend Selection
@@ -848,7 +849,7 @@ def run_batch_processing(
                 log_output.append(f"Attempting to re-initialize pipeline after error on {current_output_prefix}.")
                 print(f"Attempting to re-initialize pipeline after error on {current_output_prefix}.")
                 try:
-                    initialize_pipeline(cmd_args.precision) # cmd_args is in global scope
+                    initialize_pipeline(cmd_args.precision, cmd_args.highvram) # cmd_args is in global scope
                     log_output.append(f"Pipeline re-initialization attempt for {current_output_prefix} completed.")
                     print(f"Pipeline re-initialization attempt for {current_output_prefix} completed.")
                 except Exception as reinit_e:
@@ -1137,7 +1138,7 @@ with gr.Blocks(theme=gr.themes.Soft(), delete_cache=(600, 600)) as demo:
     )
 
 
-def initialize_pipeline(precision_arg="fp32"): 
+def initialize_pipeline(precision_arg="fp32", highvram=False): 
     global pipeline
     pipeline = TrellisImageTo3DPipeline.from_pretrained("models")
     
@@ -1155,8 +1156,44 @@ def initialize_pipeline(precision_arg="fp32"):
         if "image_cond_model" in pipeline.models:
              if hasattr(pipeline.models['image_cond_model'], 'half'):
                 pipeline.models['image_cond_model'].half()
+    
+    if highvram:
+        print("High VRAM mode enabled: All models will remain in GPU memory.")
+        # Override the _move_models method to keep models on GPU
+        original_move_models = pipeline._move_models
+        
+        def highvram_move_models(names, device, empty_cache):
+            # If trying to move to CPU, skip it to keep models on GPU
+            if device == 'cpu':
+                # Just don't do anything, keep the models on GPU
+                # But we still want to empty cache if requested
+                if empty_cache:
+                    try:
+                        torch.cuda.empty_cache()
+                    except RuntimeError as e:
+                        print(f"Failed to empty CUDA cache: {e}. Continuing...")
+                return
+            # If moving to GPU, use the original method
+            original_move_models(names, device, empty_cache)
+        
+        # Also override _move_all_models_to_cpu to do nothing
+        def highvram_move_all_models_to_cpu():
+            # Do nothing to keep all models on GPU
+            pass
+        
+        # Apply our overrides
+        pipeline._move_models = highvram_move_models
+        pipeline._move_all_models_to_cpu = highvram_move_all_models_to_cpu
+        
+        # Preload all models to GPU now
+        print("Preloading all models to GPU...")
+        for name in pipeline.models:
+            try:
+                pipeline.models[name].to('cuda')
+            except Exception as e:
+                print(f"Failed to move model {name} to GPU: {e}")
 
 
 if __name__ == "__main__":
-    initialize_pipeline(cmd_args.precision)
+    initialize_pipeline(cmd_args.precision, cmd_args.highvram)
     demo.launch(inbrowser=True, share=cmd_args.share)
