@@ -13,7 +13,6 @@ import igraph
 import cv2
 from PIL import Image
 from .random_utils import sphere_hammersley_sequence
-from .render_utils import render_multiview
 from ..renderers import GaussianRenderer
 from ..representations import Strivec, Gaussian, MeshExtractResult
 
@@ -310,6 +309,7 @@ def bake_texture(
         lambda_tv (float): Weight of total variation loss in optimization.
         verbose (bool): Whether to print progress.
     """
+    from .render_utils import render_multiview
     vertices = torch.tensor(vertices).cuda()
     faces = torch.tensor(faces.astype(np.int32)).cuda()
     uvs = torch.tensor(uvs).cuda()
@@ -430,6 +430,7 @@ def to_glb(
         debug (bool): Whether to print debug information.
         verbose (bool): Whether to print progress.
     """
+    from .render_utils import render_multiview
     vertices = mesh.vertices.cpu().numpy()
     faces = mesh.faces.cpu().numpy()
     
@@ -489,6 +490,7 @@ def simplify_gs(
         gs (Gaussian): 3D Gaussian.
         simplify (float): Ratio of Gaussians to remove in simplification.
     """
+    from .render_utils import render_multiview
     if simplify <= 0:
         return gs
     
