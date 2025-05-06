@@ -280,9 +280,7 @@ def split_image(image: Image.Image) -> List[Image.Image]:
 
 with gr.Blocks(delete_cache=(600, 600)) as demo:
     gr.Markdown("""
-    ## Image to 3D Asset with [TRELLIS](https://trellis3d.github.io/)
-    * Upload an image and click "Generate" to create a 3D asset. If the image has alpha channel, it be used as the mask. Otherwise, we use `rembg` to remove the background.
-    * If you find the generated 3D asset satisfactory, click "Extract GLB" to extract the GLB file and download it.
+    ## Image to 3D Asset with TRELLIS SECourses App (forked from trellis-stable-projectorz) : https://www.patreon.com/posts/117470976
     """)
     
     with gr.Row():
@@ -298,7 +296,7 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
                         *NOTE: this is an experimental algorithm without training a specialized model. It may not produce the best results for all images, especially those having different poses or inconsistent details.*
                     """)
             
-            with gr.Accordion(label="Generation Settings", open=False):
+            with gr.Accordion(label="Generation Settings", open=True):
                 seed = gr.Slider(0, MAX_SEED, label="Seed", value=0, step=1)
                 randomize_seed = gr.Checkbox(label="Randomize Seed", value=True)
                 gr.Markdown("Stage 1: Sparse Structure Generation")
@@ -313,8 +311,8 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
 
             generate_btn = gr.Button("Generate")
             
-            with gr.Accordion(label="GLB Extraction Settings", open=False):
-                mesh_simplify = gr.Slider(0.9, 0.98, label="Simplify", value=0.95, step=0.01)
+            with gr.Accordion(label="GLB Extraction Settings", open=True):
+                mesh_simplify = gr.Slider(0.2, 0.99, label="Simplify", value=0.2, step=0.01)
                 texture_size = gr.Slider(512, 2048, label="Texture Size", value=1024, step=512)
             
             with gr.Row():
@@ -431,7 +429,6 @@ def initialize_pipeline(precision="full"):
     # Apply precision settings. Reduce memory usage at the cost of numerical precision:
     print('')
     print(f"used precision: '{precision}'.  Loading...")
-    print(f"Trellis repo version {code_version}")
     if precision == "half" or precision=="float16":
         pipeline.to(torch.float16) #cuts memory usage in half
         if "image_cond_model" in pipeline.models:
@@ -444,6 +441,4 @@ def initialize_pipeline(precision="full"):
 # Launch the Gradio app
 if __name__ == "__main__":
     initialize_pipeline(cmd_args.precision)
-    print(f'')
-    print(f"After launched, open a browser and enter 127.0.0.1:7860 (or whatever IP and port is shown below) into url, as if it was a website:")
     demo.launch(inbrowser=True)

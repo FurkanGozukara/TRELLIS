@@ -20,7 +20,9 @@ mono_crash.*
 gradio_init_done.txt
 trellis_init_done.txt
 
-
+assets/T.ply
+models/
+venv/
 # Build results
 [Dd]ebug/
 [Dd]ebugPublic/
