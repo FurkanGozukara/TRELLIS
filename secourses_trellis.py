@@ -921,6 +921,41 @@ with gr.Blocks(theme=gr.themes.Soft(), delete_cache=(600, 600)) as demo:
         outputs=[extract_glb_btn, extract_gs_btn],
     )
 
+    # Added: Generate and extract button implementation
+    generate_and_extract_btn.click(
+        get_seed,
+        inputs=[randomize_seed_checkbox, seed_slider],
+        outputs=[seed_slider], # Update the displayed seed
+    ).then(
+        image_to_3d,
+        inputs=[
+            image_prompt, multiimage_prompt, is_multiimage, seed_slider, 
+            ss_guidance_strength_slider, ss_sampling_steps_slider, 
+            slat_guidance_strength_slider, slat_sampling_steps_slider, 
+            multiimage_algo_radio,
+            video_resolution_slider, video_num_frames_slider, video_fps_slider,
+            save_metadata_checkbox
+        ],
+        outputs=[output_buf, video_output],
+    ).then(
+        lambda: (gr.update(interactive=True), gr.update(interactive=True)),
+        outputs=[extract_glb_btn, extract_gs_btn],
+    ).then(
+        extract_glb,
+        inputs=[output_buf, mesh_simplify_slider, texture_size_slider, save_metadata_checkbox],
+        outputs=[model_output, download_glb],
+    ).then(
+        lambda _: gr.update(interactive=True),
+        outputs=[download_glb],
+    ).then(
+        extract_gaussian,
+        inputs=[output_buf, save_metadata_checkbox],
+        outputs=[model_output, download_gs],
+    ).then(
+        lambda _: gr.update(interactive=True),
+        outputs=[download_gs],
+    )
+
     video_output.clear(
         lambda: (gr.update(interactive=False), gr.update(interactive=False)),
         outputs=[extract_glb_btn, extract_gs_btn],
