@@ -861,7 +861,7 @@ def run_batch_processing(
 # Gradio UI
 with gr.Blocks(theme=gr.themes.Soft(), delete_cache=(600, 600)) as demo:
     gr.Markdown("""
-    ## Image to 3D Asset with TRELLIS SECourses App (forked from trellis-stable-projectorz) V5 > https://www.patreon.com/posts/117470976
+    ## Image to 3D Asset with TRELLIS SECourses App (forked from trellis-stable-projectorz) V6 > https://www.patreon.com/posts/117470976
     """.format(code_version))
     
     seed_val = gr.State()

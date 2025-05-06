@@ -455,4 +455,7 @@ class TrellisImageTo3DPipeline(Pipeline):
             if current_device != target_device:
                 self.models[name].to(device)
         if empty_cache:
-            torch.cuda.empty_cache()
+            try:
+                torch.cuda.empty_cache()
+            except RuntimeError as e:
+                logger.warning(f"Failed to empty CUDA cache during _move_models: {e}. Continuing...")
