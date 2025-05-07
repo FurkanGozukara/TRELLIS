@@ -63,6 +63,7 @@ import subprocess
 import re
 import glob as sistema_glob # Renamed to avoid conflict with local glob
 from filelock import FileLock # For robust file naming
+import rembg
 
 # ------------------------------------------------
 
@@ -350,7 +351,7 @@ def extract_glb(
     actual_glb_path = os.path.join(glb_dir, f"{glb_filename_base}.glb")
     os.makedirs(os.path.dirname(actual_glb_path), exist_ok=True) # For batch subfolders
 
-    glb_data = postprocessing_utils.to_glb(gs, mesh, simplify=mesh_simplify, texture_size=texture_size, verbose=False)
+    glb_data = postprocessing_utils.to_glb(gs, mesh, simplify=mesh_simplify, texture_size=texture_size, verbose=True)
     glb_data.export(actual_glb_path)
 
     # No temp_reservation_path to remove here as it's based on state['filename_base']
@@ -876,7 +877,7 @@ def run_batch_processing(
 # Gradio UI
 with gr.Blocks(theme=gr.themes.Soft(), delete_cache=(600, 600)) as demo:
     gr.Markdown("""
-    ## Image to 3D Asset with TRELLIS SECourses App (forked from trellis-stable-projectorz) V7 > https://www.patreon.com/posts/117470976
+    ## Image to 3D Asset with TRELLIS SECourses App (forked from trellis-stable-projectorz) V8 > https://www.patreon.com/posts/117470976
     """.format(code_version))
     
     seed_val = gr.State()
@@ -1192,6 +1193,38 @@ def initialize_pipeline(precision_arg="fp32", highvram=False):
                 pipeline.models[name].to('cuda')
             except Exception as e:
                 print(f"Failed to move model {name} to GPU: {e}")
+        
+        # Additional optimizations for high VRAM mode
+        # 1. Enable GPU for background removal if available
+        original_preprocess_image = pipeline.preprocess_image
+        
+        def highvram_preprocess_image(input):
+            # Only recreate the rembg session if it doesn't exist or was CPU-only
+            if getattr(pipeline, 'rembg_session', None) is None or "CPUExecutionProvider" in str(pipeline.rembg_session):
+                try:
+                    # Try to use CUDA for background removal instead of CPU
+                    print("Attempting to use CUDA for background removal...")
+                    pipeline.rembg_session = rembg.new_session('u2net', providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+                except Exception as e:
+                    print(f"Failed to initialize rembg with CUDA, falling back to CPU: {e}")
+                    if getattr(pipeline, 'rembg_session', None) is None:
+                        pipeline.rembg_session = rembg.new_session('u2net', providers=["CPUExecutionProvider"])
+            return original_preprocess_image(input)
+        
+        # Override the preprocess_image method
+        pipeline.preprocess_image = highvram_preprocess_image
+        
+        # 2. Optimize torch operations
+        if torch.cuda.is_available():
+            # Set optimal CUDA settings for performance
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.deterministic = False
+            
+            # Use TF32 precision on Ampere or newer GPUs for better performance if using FP32
+            if effective_precision == "full" and hasattr(torch.cuda, 'amp') and hasattr(torch.cuda.amp, 'autocast'):
+                if torch.cuda.get_device_capability()[0] >= 8:  # Ampere or newer
+                    print("Enabling TF32 precision for matrix multiplications on Ampere+ GPU")
+                    torch.set_float32_matmul_precision('high')  # Use TF32
 
 
 if __name__ == "__main__":

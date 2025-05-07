@@ -201,7 +201,7 @@ def extract_glb(
     """
     user_dir = os.path.join(TMP_DIR, str(req.session_hash))
     gs, mesh = unpack_state(state)
-    glb = postprocessing_utils.to_glb(gs, mesh, simplify=mesh_simplify, texture_size=texture_size, verbose=False)
+    glb = postprocessing_utils.to_glb(gs, mesh, simplify=mesh_simplify, texture_size=texture_size, verbose=True)
     glb_path = os.path.join(user_dir, 'sample.glb')
     glb.export(glb_path)
     torch.cuda.empty_cache()
