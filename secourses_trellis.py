@@ -453,7 +453,7 @@ def get_default_config_values():
         "num_generations_val": 1, # Added
         "mesh_simplify_val": 0.9,
         "texture_size_val": 1024,
-        "video_resolution_val": 1024, "video_num_frames_val": 240, "video_fps_val": 30,
+        "video_resolution_val": 512, "video_num_frames_val": 240, "video_fps_val": 30,
         "save_metadata_val": True,
         "batch_input_folder_val": "batch_input_images",
         "batch_output_folder_val": BATCH_OUTPUT_DIR_BASE_DEFAULT,
@@ -579,7 +579,7 @@ def perform_generations_and_optional_extractions(
     video_resolution_int, video_num_frames_int, video_fps_int,
     save_metadata_bool,
     mesh_simplify_float, texture_size_int,
-    progress=gr.Progress(track_tqdm=True)
+    progress=gr.Progress(track_tqdm=False)
 ):
     global CANCEL_REQUESTED
     CANCEL_REQUESTED = False # Reset at the start of a new task sequence
@@ -716,13 +716,14 @@ def run_batch_processing(
     slat_guidance_strength_val, slat_sampling_steps_val, multiimage_algo_val,
     mesh_simplify_val, texture_size_val, video_resolution_val, video_num_frames_val,
     video_fps_val, save_metadata_val,
-    progress=gr.Progress(track_tqdm=True)
+    progress=gr.Progress(track_tqdm=False)
 ):
     global CANCEL_REQUESTED
     CANCEL_REQUESTED = False 
 
     if not os.path.isdir(batch_input_dir):
-        return "Error: Batch input directory not found."
+        yield "Error: Batch input directory not found." # Yield instead of return
+        return # Added return to exit after yield
 
     # Use the provided batch_output_base_name to create a subfolder in the main directory
     batch_output_dir_specific = os.path.join(os.getcwd(), batch_output_base_name)
@@ -751,7 +752,8 @@ def run_batch_processing(
     all_files = sorted(list(set(all_files)), key=alphanum_key)
 
     if not all_files:
-        return "No images found in the batch input directory."
+        yield "No images found in the batch input directory." # Yield instead of return
+        return # Added return
 
     try:
         num_gens_per_image = int(float(num_generations_from_slider))
@@ -762,6 +764,7 @@ def run_batch_processing(
     total_images = len(all_files)
     total_iterations = total_images * num_gens_per_image
     log_output = [f"Starting batch processing: {total_images} images, {num_gens_per_image} generation(s) per image. Total iterations: {total_iterations}"]
+    yield "\n".join(log_output) # Initial yield
     
     start_batch_time = time.time()
     processed_iterations_count = 0
@@ -769,6 +772,7 @@ def run_batch_processing(
     for i, image_path in enumerate(all_files):
         if CANCEL_REQUESTED:
             log_output.append("Batch processing cancelled by user request.")
+            yield "\n".join(log_output) # Yield before break
             break 
         
         input_basename = os.path.splitext(os.path.basename(image_path))[0]
@@ -777,6 +781,7 @@ def run_batch_processing(
         for iter_k in range(num_gens_per_image):
             if CANCEL_REQUESTED:
                 log_output.append(f"Cancellation requested during processing of {input_basename} (iteration {iter_k+1}).")
+                yield "\n".join(log_output) # Yield before break
                 break # Breaks inner loop (iterations for current file)
 
             processed_iterations_count += 1
@@ -786,6 +791,7 @@ def run_batch_processing(
             current_output_prefix = input_basename + iter_suffix
             
             log_output.append(f"Processing: {current_output_prefix} (Overall iter {processed_iterations_count}/{total_iterations})")
+            yield "\n".join(log_output) # Yield after appending
             print(f"Batch Processing: {current_output_prefix} (Overall iter {processed_iterations_count}/{total_iterations})")
 
             if skip_existing:
@@ -801,6 +807,7 @@ def run_batch_processing(
                 if video_needed_exists and glb_needed_exists and gs_needed_exists:
                     log_output.append(f"  Skipping {current_output_prefix}, all requested outputs already exist.")
                     print(f"  Skipping {current_output_prefix}, outputs exist.")
+                    yield "\n".join(log_output) # Yield after skipping
                     continue # Skip this iteration
             
             try:
@@ -822,16 +829,19 @@ def run_batch_processing(
                     custom_output_dirs=custom_output_dirs  # Pass the custom directories
                 )
                 log_output.append(f"  Generated video: {video_out_path}")
+                yield "\n".join(log_output) # Yield after video gen
 
                 if extract_glb_cb:
                     if CANCEL_REQUESTED: break
                     glb_path, _ = extract_glb(generated_state, mesh_simplify_val, texture_size_val, save_metadata_val)
                     log_output.append(f"  Extracted GLB: {glb_path}")
+                    yield "\n".join(log_output) # Yield after GLB
                 
                 if extract_gs_cb:
                     if CANCEL_REQUESTED: break
                     gs_path, _ = extract_gaussian(generated_state, save_metadata_val)
                     log_output.append(f"  Extracted Gaussian Splats: {gs_path}")
+                    yield "\n".join(log_output) # Yield after GS
                 
                 elapsed_time = time.time() - start_batch_time
                 avg_time_per_iter = elapsed_time / processed_iterations_count if processed_iterations_count > 0 else 0
@@ -844,24 +854,30 @@ def run_batch_processing(
                 error_msg = f"Error processing {current_output_prefix}: {str(e)}"
                 log_output.append(error_msg)
                 print(error_msg)
+                yield "\n".join(log_output) # Yield after error
                 import traceback
                 traceback.print_exc()
 
                 log_output.append(f"Attempting to re-initialize pipeline after error on {current_output_prefix}.")
                 print(f"Attempting to re-initialize pipeline after error on {current_output_prefix}.")
+                yield "\n".join(log_output) # Yield before re-init
                 try:
                     initialize_pipeline(cmd_args.precision, cmd_args.highvram) # cmd_args is in global scope
                     log_output.append(f"Pipeline re-initialization attempt for {current_output_prefix} completed.")
                     print(f"Pipeline re-initialization attempt for {current_output_prefix} completed.")
+                    yield "\n".join(log_output) # Yield after re-init
                 except Exception as reinit_e:
                     reinit_error_msg = f"CRITICAL: Failed to re-initialize pipeline after error on {current_output_prefix}: {str(reinit_e)}"
                     log_output.append(reinit_error_msg)
                     print(reinit_error_msg)
+                    yield "\n".join(log_output) # Yield after critical error
                     log_output.append("Stopping batch processing as pipeline re-initialization failed.")
                     print("Stopping batch processing as pipeline re-initialization failed.")
+                    yield "\n".join(log_output) # Yield before stopping
                     break # Stop the batch if we can't even re-init the pipeline
         
         if CANCEL_REQUESTED: # Check after inner loop too, to break outer file loop
+            yield "\n".join(log_output) # Ensure last logs are yielded
             break
     
     final_msg = f"Batch processing finished. Processed {processed_iterations_count}/{total_iterations} iterations."
@@ -871,13 +887,13 @@ def run_batch_processing(
     
     log_output.append(final_msg)
     print(final_msg)
-    return "\n".join(log_output)
+    yield "\n".join(log_output) # Final yield of all logs
 
 
 # Gradio UI
 with gr.Blocks(theme=gr.themes.Soft(), delete_cache=(600, 600)) as demo:
     gr.Markdown("""
-    ## Image to 3D Asset with TRELLIS SECourses App (forked from trellis-stable-projectorz) V8 > https://www.patreon.com/posts/117470976
+    ## Image to 3D Asset with TRELLIS SECourses App (forked from trellis-stable-projectorz) V9 > https://www.patreon.com/posts/117470976
     """.format(code_version))
     
     seed_val = gr.State()
