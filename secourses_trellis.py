@@ -130,9 +130,13 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("XFORMERS_DISABLED", "1")
 
 # Linux only, and a no-op everywhere else.  torch's Linux wheels do not bundle the CUDA
-# runtime the way the Windows ones bundle it in torch\lib, so cumm/spconv can die with
-# "libnvrtc-builtins.so.<major>.<minor>: cannot open shared object file".  Pre-loading
-# the libraries with RTLD_GLOBAL here fixes it for every extension imported later.
+# runtime the way the Windows ones bundle it in torch\lib, so a CUDA extension that names
+# a minor-versioned soname dies with
+# "libnvrtc-builtins.so.<major>.<minor>: cannot open shared object file".
+# The pinned cumm/spconv wheels no longer do that - they were rebuilt to reference only
+# major-versioned sonames and carry a RUNPATH into nvidia/cu13/lib - so this is now a
+# safety net against a stale cached wheel rather than the thing that makes them work.  It
+# pre-loads exactly one 6 MB file, because this module also runs in every job worker.
 # LD_LIBRARY_PATH is not an option: the loader reads it once, before Python starts.
 try:
     import cuda_linux_deps                # noqa: E402  (APP_DIR is on sys.path above)
