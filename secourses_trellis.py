@@ -2277,9 +2277,15 @@ def sweep_job_tmp(max_age_hours: float = 24.0) -> None:
         cprint(f"[{stamp()}] Cleaned {removed} stale job file(s) from {JOB_TMP_DIR}.", "dim")
 
 
-def _stash_images_for_worker(image, multiimages, is_multiimage) -> Dict[str, Any]:
-    """A child process cannot be handed PIL objects, so put the pixels on disk."""
+def _stash_images_for_worker(image, multiimages, is_multiimage) -> Tuple[Dict[str, Any], List[str]]:
+    """A child process cannot be handed PIL objects, so put the pixels on disk.
+
+    Returns the kwargs plus the list of files *we* created, so the caller can delete them
+    again - a path the user already had on disk is passed straight through and must not
+    end up in that list.
+    """
     from PIL import Image as PILImage                              # cheap, pillow is already up
+    created: List[str] = []
     if is_multiimage:
         paths = []
         for idx, item in enumerate(multiimages or []):
@@ -2290,12 +2296,14 @@ def _stash_images_for_worker(image, multiimages, is_multiimage) -> Dict[str, Any
             path = _new_job_tmp(f"view{idx:02d}.png")
             (raw if isinstance(raw, PILImage.Image) else PILImage.fromarray(raw)).save(path)
             paths.append(path)
-        return {"multiimage_paths": paths, "image_path": None}
+            created.append(path)
+        return {"multiimage_paths": paths, "image_path": None}, created
     if isinstance(image, str):
-        return {"image_path": image, "multiimage_paths": None}
+        return {"image_path": image, "multiimage_paths": None}, created
     path = _new_job_tmp("input.png")
     (image if isinstance(image, PILImage.Image) else PILImage.fromarray(image)).save(path)
-    return {"image_path": path, "multiimage_paths": None}
+    created.append(path)
+    return {"image_path": path, "multiimage_paths": None}, created
 
 
 def state_ref(value) -> Tuple[Optional[dict], Optional[str]]:
@@ -2348,13 +2356,22 @@ def do_generate(job: JobState, *, isolate: bool, precision: str, image, multiima
     # kwargs by this point - the images have already been written to disk.
 
     state_path = _new_job_tmp("state.npz")
+    image_kwargs, stashed = _stash_images_for_worker(image, multiimages, is_multiimage)
     payload = {
         "precision": precision,
         "state_path": state_path,
-        "kwargs": {**kwargs, **_stash_images_for_worker(image, multiimages, is_multiimage),
-                   "is_multiimage": bool(is_multiimage)},
+        "kwargs": {**kwargs, **image_kwargs, "is_multiimage": bool(is_multiimage)},
     }
-    result = run_isolated(job, "generate", payload)
+    try:
+        result = run_isolated(job, "generate", payload)
+    finally:
+        # The child has read them by now (or died trying); either way they are ours to
+        # remove, and at ~1 MB a run they add up over a batch.
+        for path in stashed:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
     ref = {"__state_path__": result["state_path"], "filename_base": result.get("filename_base"),
            "has_mesh": bool(result.get("has_mesh"))}
     return ref, result.get("video")
@@ -2879,7 +2896,8 @@ def system_info_markdown() -> str:
             rows.append(("GPU", f"{ENGINE.device_name} — {ENGINE.total_vram_gb:.1f} GB"))
             rows.append(("VRAM", ENGINE.vram_report()))
     rows.append(("Outputs folder", OUTPUT_DIR_BASE))
-    rows.append(("Presets folder", CONFIG_DIR))
+    rows.append(("Protected presets", f"{PRESET_DIR_BUILTIN} (rewritten every start)"))
+    rows.append(("Your presets", f"{PRESET_DIR_USER} ({len(user_preset_names())} saved)"))
 
     body = "\n".join(f"| **{k}** | {v} |" for k, v in rows)
     return f"| | |\n|---|---|\n{body}"
