@@ -434,6 +434,9 @@ def to_glb(
     debug: bool = False,
     verbose: bool = True,
     cancel_event = None,
+    bake_resolution: int = 1024,
+    bake_nviews: int = 100,
+    fill_holes_resolution: int = 1024,
 ) -> trimesh.Trimesh:
     """
     Convert a generated asset to a glb file.
@@ -447,6 +450,12 @@ def to_glb(
         texture_size (int): Size of the texture.
         debug (bool): Whether to print debug information.
         verbose (bool): Whether to print progress.
+        bake_resolution (int): Resolution of each view rendered for texture baking.
+            The views are held on the GPU as fp16, so this is the dominant VRAM
+            term of this function - halving it quarters that buffer.
+        bake_nviews (int): How many views to render for texture baking. Fewer views
+            use proportionally less VRAM but can leave unseen patches untextured.
+        fill_holes_resolution (int): Rasterisation resolution of the hole-filling pass.
     """
     from .render_utils import render_multiview
     vertices = mesh.vertices.cpu().numpy()
@@ -460,7 +469,7 @@ def to_glb(
         fill_holes=fill_holes,
         fill_holes_max_hole_size=fill_holes_max_size,
         fill_holes_max_hole_nbe=int(250 * np.sqrt(1-simplify)),
-        fill_holes_resolution=1024,
+        fill_holes_resolution=fill_holes_resolution,
         fill_holes_num_views=1000,
         debug=debug,
         verbose=verbose,
@@ -473,7 +482,8 @@ def to_glb(
     vertices, faces, uvs = parametrize_mesh(vertices, faces)
 
     # bake texture
-    observations, extrinsics, intrinsics = render_multiview(app_rep, resolution=1024, nviews=100,
+    observations, extrinsics, intrinsics = render_multiview(app_rep, resolution=bake_resolution,
+                                                            nviews=bake_nviews,
                                                             cancel_event=cancel_event)
     masks = [np.any(observation > 0, axis=-1) for observation in observations]
     extrinsics = [extrinsics[i].cpu().numpy() for i in range(len(extrinsics))]
@@ -490,7 +500,13 @@ def to_glb(
 
     # rotate mesh (from z-up to y-up)
     vertices = vertices @ np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
+    # metallicFactor has to be written explicitly: glTF defaults it to 1.0, so a material
+    # that omits it is a fully metallic surface with no environment to reflect, which every
+    # PBR viewer renders as a dark, desaturated blob. The baked texture is plain albedo, so
+    # the mesh is a dielectric -- 0.0 is both correct and what makes the preview match the
+    # colour turntable.
     material = trimesh.visual.material.PBRMaterial(
+        metallicFactor=0.0,
         roughnessFactor=1.0,
         baseColorTexture=texture,
         baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8)

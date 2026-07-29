@@ -66,6 +66,8 @@ parser.add_argument("--no-tf32", action="store_true",
 parser.add_argument("--no-browser", action="store_true", help="Do not open a browser tab on start.")
 parser.add_argument("--port", type=int, default=None, help="Server port (default: 7860 upwards).")
 parser.add_argument("--listen", action="store_true", help="Bind to 0.0.0.0 instead of 127.0.0.1.")
+parser.add_argument("--worker", metavar="JOBFILE", default=None,
+                    help=argparse.SUPPRESS)   # internal: run one isolated job, then exit
 cmd_args = parser.parse_args()
 
 # --------------------------------------------------------------------------------------
@@ -206,11 +208,19 @@ DEFAULT_BATCH_INPUT = os.path.join(APP_DIR, "batch_input_images")
 FAVICON_PATH = os.path.join(APP_DIR, "favicon.svg")
 
 CONFIG_DIR = os.path.join(APP_DIR, "configs_trellis")
+# Two preset folders. The app owns everything in `presets_builtin` and rewrites it on
+# every start, so a user can never end up with a corrupted or stale VRAM preset; their
+# own presets live next door in `presets_user` and are never touched by the app.
+PRESET_DIR_BUILTIN = os.path.join(CONFIG_DIR, "presets_builtin")
+PRESET_DIR_USER = os.path.join(CONFIG_DIR, "presets_user")
 LAST_CONFIG_FILE = os.path.join(CONFIG_DIR, "last_used_config_trellis.json")
 DEFAULT_CONFIG_NAME = "Default"
 
+JOB_TMP_DIR = os.path.join(APP_DIR, "tmp", "jobs")
+
 for _d in (OUTPUT_DIR_BASE, OUTPUT_VIDEO_DIR, OUTPUT_GLB_DIR, OUTPUT_GAUSSIAN_DIR,
-           OUTPUT_METADATA_DIR, CONFIG_DIR, DEFAULT_BATCH_INPUT):
+           OUTPUT_METADATA_DIR, CONFIG_DIR, PRESET_DIR_BUILTIN, PRESET_DIR_USER,
+           DEFAULT_BATCH_INPUT, JOB_TMP_DIR):
     os.makedirs(_d, exist_ok=True)
 
 
@@ -282,6 +292,171 @@ def open_folder(path: str) -> str:
         return f"Opened: {path}"
     except Exception as exc:                                     # pragma: no cover
         return f"Error opening folder: {exc}"
+
+
+# --------------------------------------------------------------------------------------
+# GPU probe (no torch - this runs before the heavy imports so the UI still starts fast)
+# --------------------------------------------------------------------------------------
+def _visible_device_index() -> int:
+    """Which physical GPU torch will call device 0."""
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if not visible:
+        return 0
+    first = visible.split(",")[0].strip()
+    try:
+        return int(first)
+    except ValueError:              # a UUID - we cannot map it, assume the first card
+        return 0
+
+
+def probe_gpu() -> Tuple[Optional[str], Optional[float]]:
+    """Return (name, total VRAM in GiB) for the GPU the app will use, or (None, None).
+
+    nvidia-smi reports MiB as the card advertises it, which is what a user compares
+    against when they say "I have a 12 GB card" - so this is the right number to bucket
+    on, not torch's slightly smaller `total_memory`.
+    """
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=15, check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    rows = [r.strip() for r in out.splitlines() if r.strip()]
+    idx = _visible_device_index()
+    if idx >= len(rows):
+        idx = 0
+    if not rows:
+        return None, None
+    try:
+        name, mib = rows[idx].rsplit(",", 1)
+        return name.strip(), int(mib.strip()) / 1024.0
+    except (ValueError, IndexError):
+        return None, None
+
+
+GPU_NAME, GPU_VRAM_GB = probe_gpu()
+
+
+# --------------------------------------------------------------------------------------
+# VRAM presets
+# --------------------------------------------------------------------------------------
+VRAM_TIERS = (6, 8, 10, 12, 16, 24, 32)
+# A card that advertises 12 GB reports 12288 MiB but hands torch a little less, and a
+# 32 GB card can report 31.8 GB. Round up by this much before bucketing so those land
+# on the tier the user would name themselves.
+VRAM_TIER_MARGIN_GB = 0.5
+
+
+def vram_preset_name(tier_gb: int) -> str:
+    return f"VRAM {tier_gb} GB"
+
+
+def pick_vram_tier(total_gb: Optional[float]) -> int:
+    """Highest tier the card can claim once the margin is added."""
+    if not total_gb:
+        return 12                                     # no GPU detected - middle of the road
+    budget = total_gb + VRAM_TIER_MARGIN_GB
+    eligible = [t for t in VRAM_TIERS if t <= budget]
+    return eligible[-1] if eligible else VRAM_TIERS[0]
+
+
+# `peak_gb` is measured, not estimated: each preset was run end to end (generate +
+# GLB + Gaussian) while sampling `torch.cuda.mem_get_info()` every 15 ms, so it is the
+# true device occupancy - allocator, CUDA context and driver overhead included - and
+# not torch's `max_memory_allocated`, which ignores the ~1.2-1.7 GB CUDA context.
+# Measured on an RTX 5090; the CUDA context is ~0.4 GB smaller on cards with fewer SMs,
+# so smaller GPUs sit a little under these numbers.
+VRAM_PRESET_SPECS: Dict[int, Dict[str, Any]] = {
+    6: {
+        "peak_gb": 4.4,
+        "peak_glb_gb": 7.0,
+        "note": "Gaussian splat + video fit comfortably. GLB/mesh extraction needs ~7 GB "
+                "on any settings — see the warning below.",
+        "values": {
+            "precision_val": "fp16", "isolate_jobs_val": True,
+            "ss_sampling_steps_val": 12, "slat_sampling_steps_val": 12,
+            "video_resolution_val": 512, "video_num_frames_val": 120, "video_fps_val": 30,
+            "video_quality_val": 7, "include_geometry_val": False,
+            "mesh_simplify_val": 0.96, "texture_size_val": 512,
+            "bake_resolution_val": 384, "bake_nviews_val": 40,
+        },
+    },
+    8: {
+        "peak_gb": 7.0,
+        "note": "Everything works, with little room to spare — close other GPU apps.",
+        "values": {
+            "precision_val": "fp16", "isolate_jobs_val": True,
+            "ss_sampling_steps_val": 12, "slat_sampling_steps_val": 12,
+            "video_resolution_val": 512, "video_num_frames_val": 150, "video_fps_val": 30,
+            "video_quality_val": 8, "include_geometry_val": False,
+            "mesh_simplify_val": 0.95, "texture_size_val": 1024,
+            "bake_resolution_val": 512, "bake_nviews_val": 60,
+        },
+    },
+    10: {
+        "peak_gb": 7.5,
+        "note": "Full feature set including the geometry pass in the preview video.",
+        "values": {
+            "precision_val": "fp16", "isolate_jobs_val": True,
+            "ss_sampling_steps_val": 14, "slat_sampling_steps_val": 14,
+            "video_resolution_val": 768, "video_num_frames_val": 180, "video_fps_val": 30,
+            "video_quality_val": 8, "include_geometry_val": True,
+            "mesh_simplify_val": 0.94, "texture_size_val": 1024,
+            "bake_resolution_val": 768, "bake_nviews_val": 80,
+        },
+    },
+    12: {
+        "peak_gb": 7.7,
+        "note": "Half precision keeps the mesh decoder inside 12 GB; full precision would "
+                "need ~12.1 GB and leave nothing for the desktop.",
+        "values": {
+            "precision_val": "fp16", "isolate_jobs_val": False,
+            "ss_sampling_steps_val": 16, "slat_sampling_steps_val": 16,
+            "video_resolution_val": 1024, "video_num_frames_val": 240, "video_fps_val": 60,
+            "video_quality_val": 8, "include_geometry_val": True,
+            "mesh_simplify_val": 0.92, "texture_size_val": 1024,
+            "bake_resolution_val": 1024, "bake_nviews_val": 100,
+        },
+    },
+    16: {
+        "peak_gb": 12.2,
+        "note": "Full fp32 precision — the reference quality setting.",
+        "values": {
+            "precision_val": "fp32", "isolate_jobs_val": False,
+            "ss_sampling_steps_val": 18, "slat_sampling_steps_val": 18,
+            "video_resolution_val": 1024, "video_num_frames_val": 240, "video_fps_val": 60,
+            "video_quality_val": 9, "include_geometry_val": True,
+            "mesh_simplify_val": 0.90, "texture_size_val": 1024,
+            "bake_resolution_val": 1024, "bake_nviews_val": 100,
+        },
+    },
+    24: {
+        "peak_gb": 12.4,
+        "note": "fp32 with a 2K baked texture and a denser mesh.",
+        "values": {
+            "precision_val": "fp32", "isolate_jobs_val": False,
+            "ss_sampling_steps_val": 20, "slat_sampling_steps_val": 20,
+            "video_resolution_val": 1024, "video_num_frames_val": 300, "video_fps_val": 60,
+            "video_quality_val": 9, "include_geometry_val": True,
+            "mesh_simplify_val": 0.88, "texture_size_val": 2048,
+            "bake_resolution_val": 1024, "bake_nviews_val": 120,
+        },
+    },
+    32: {
+        "peak_gb": 12.8,
+        "note": "Maximum quality — nothing is traded away for memory.",
+        "values": {
+            "precision_val": "fp32", "isolate_jobs_val": False,
+            "ss_sampling_steps_val": 25, "slat_sampling_steps_val": 25,
+            "video_resolution_val": 1536, "video_num_frames_val": 360, "video_fps_val": 60,
+            "video_quality_val": 10, "include_geometry_val": True,
+            "mesh_simplify_val": 0.85, "texture_size_val": 2048,
+            "bake_resolution_val": 1024, "bake_nviews_val": 150,
+        },
+    },
+}
 
 
 def human_bytes(num: Optional[float]) -> str:
@@ -589,20 +764,45 @@ class Engine:
         self.device_name = "unknown"
         self.total_vram_gb = 0.0
         self.error: Optional[str] = None
+        self.precision = cmd_args.precision
 
     # -- public ---------------------------------------------------------------------
-    def ensure(self, job: Optional[JobState] = None):
-        if self.ready:
+    def ensure(self, job: Optional[JobState] = None, precision: Optional[str] = None):
+        """Return the pipeline, building it first if needed.
+
+        `precision` comes from the active preset, so switching between a fp32 and a fp16
+        tier has to rebuild the pipeline - the weights themselves are cast in place.
+        """
+        want = precision if precision in ("fp16", "fp32") else self.precision
+        if self.ready and want == self.precision:
             return self.pipeline
         with self.lock:
-            if self.ready:
+            if self.ready and want == self.precision:
                 return self.pipeline
+            if self.ready and want != self.precision:
+                self._unload(job, f"switching precision {self.precision} -> {want}")
+            self.precision = want
             self._load(job)
         return self.pipeline
 
+    def _unload(self, job: Optional[JobState], why: str) -> None:
+        msg = f"Releasing the current pipeline ({why})."
+        if job is not None:
+            job.log(msg, level="warn")
+        else:
+            cprint(f"[{stamp()}] {msg}", "yellow")
+        self.ready = False
+        self.pipeline = None
+        import gc
+        gc.collect()
+        if self.torch is not None and self.torch.cuda.is_available():
+            self.torch.cuda.empty_cache()
+            self.torch.cuda.reset_peak_memory_stats()
+
     def status_line(self) -> str:
         if self.ready:
-            return f"Engine ready ({self.device_name}, loaded in {self.load_seconds:.1f}s)"
+            return (f"Engine ready ({self.device_name}, {self.precision}, "
+                    f"loaded in {self.load_seconds:.1f}s)")
         if self.loading:
             return "Engine is loading..."
         if self.error:
@@ -660,8 +860,9 @@ class Engine:
             pipeline = TrellisImageTo3DPipeline.from_pretrained(os.path.join(APP_DIR, "models"))
             self._patch_dinov2_attention(note)
 
-            if cmd_args.precision == "fp16":
-                note("Converting the pipeline to half precision (fp16).")
+            if self.precision == "fp16":
+                note("Converting the pipeline to half precision (fp16) - this is what keeps "
+                     "the mesh decoder inside ~7.7 GB instead of ~12.1 GB.")
                 pipeline.to(torch.float16)
                 cond = pipeline.models.get("image_cond_model")
                 if cond is not None and hasattr(cond, "half"):
@@ -1113,7 +1314,7 @@ def generate_one(
             "video_quality": int(video_quality) if make_video else None,
             "video_includes_geometry_pass": bool(include_geometry) if make_video else False,
             "attention_backend": ATTENTION_BACKEND,
-            "precision": cmd_args.precision,
+            "precision": ENGINE.precision,
             "mesh_vertices": int(mesh.vertices.shape[0]),
             "mesh_triangles": int(mesh.faces.shape[0]),
             "num_gaussians": int(gaussian._xyz.shape[0]),
@@ -1133,7 +1334,8 @@ def generate_one(
 
 
 def extract_glb_file(job: JobState, state: dict, mesh_simplify: float, texture_size: int,
-                     save_metadata: bool) -> str:
+                     save_metadata: bool, bake_resolution: int = 1024,
+                     bake_nviews: int = 100) -> str:
     torch = ENGINE.torch
     gs, mesh = unpack_state(state)
     vertex_count = int(mesh.vertices.shape[0])
@@ -1153,10 +1355,14 @@ def extract_glb_file(job: JobState, state: dict, mesh_simplify: float, texture_s
     # texture-bake UV pass, texture-bake optimisation.
     job.stage("Building the textured GLB (decimate -> hole fill -> UV -> bake)", bars=4)
     job.set_detail(f"input mesh {vertex_count:,} verts / {face_count:,} tris · "
-                   f"simplify {mesh_simplify} · texture {texture_size}px")
+                   f"simplify {mesh_simplify} · texture {texture_size}px · "
+                   f"bake {int(bake_resolution)}px × {int(bake_nviews)} views")
     glb_data = ENGINE.postprocessing_utils.to_glb(
         gs, mesh, simplify=float(mesh_simplify), texture_size=int(texture_size),
         verbose=True, cancel_event=job.cancel_event,
+        bake_resolution=int(bake_resolution), bake_nviews=int(bake_nviews),
+        # The hole-filling rasteriser does not need to be finer than the views we bake from.
+        fill_holes_resolution=max(512, min(1024, int(bake_resolution))),
     )
     job.raise_if_cancelled()
     glb_data.export(glb_path)
@@ -1215,9 +1421,11 @@ PRESET_KEYS = [
     "ss_guidance_strength_val", "ss_sampling_steps_val",
     "slat_guidance_strength_val", "slat_sampling_steps_val", "multiimage_algo_val",
     "mesh_simplify_val", "texture_size_val",
+    "bake_resolution_val", "bake_nviews_val",
     "video_resolution_val", "video_num_frames_val", "video_fps_val",
     "video_quality_val", "include_geometry_val",
     "save_metadata_val",
+    "precision_val", "isolate_jobs_val",
     "batch_input_folder_val", "batch_output_folder_val", "batch_skip_existing_val",
     "batch_gen_video_cb_val", "batch_extract_glb_cb_val", "batch_extract_gaussian_cb_val",
 ]
@@ -1235,12 +1443,16 @@ def get_default_config_values() -> Dict[str, Any]:
         "multiimage_algo_val": "stochastic",
         "mesh_simplify_val": 0.9,
         "texture_size_val": 1024,
+        "bake_resolution_val": 1024,
+        "bake_nviews_val": 100,
         "video_resolution_val": 1024,
         "video_num_frames_val": 240,
         "video_fps_val": 60,
         "video_quality_val": 8,
         "include_geometry_val": True,
         "save_metadata_val": True,
+        "precision_val": cmd_args.precision,
+        "isolate_jobs_val": False,
         "batch_input_folder_val": DEFAULT_BATCH_INPUT,
         "batch_output_folder_val": BATCH_OUTPUT_DIR_BASE_DEFAULT,
         "batch_skip_existing_val": True,
@@ -1250,11 +1462,88 @@ def get_default_config_values() -> Dict[str, Any]:
     }
 
 
+def vram_preset_values(tier_gb: int) -> Dict[str, Any]:
+    """A full config for one VRAM tier: the defaults with that tier's overrides on top."""
+    values = get_default_config_values()
+    values.update(VRAM_PRESET_SPECS[tier_gb]["values"])
+    return values
+
+
+BUILTIN_PRESET_NAMES: List[str] = [DEFAULT_CONFIG_NAME] + [vram_preset_name(t) for t in VRAM_TIERS]
+
+
+def write_builtin_presets() -> None:
+    """Rewrite the protected folder from code on every start.
+
+    These files exist so the user can read (and copy) them, not so they can edit them -
+    anything they change here is overwritten next launch, which is exactly what makes
+    them safe to fall back on.
+    """
+    os.makedirs(PRESET_DIR_BUILTIN, exist_ok=True)
+    payloads = {DEFAULT_CONFIG_NAME: get_default_config_values()}
+    for tier in VRAM_TIERS:
+        payloads[vram_preset_name(tier)] = vram_preset_values(tier)
+    for name, data in payloads.items():
+        try:
+            with open(os.path.join(PRESET_DIR_BUILTIN, f"{name}.json"), "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=4)
+        except OSError as exc:                                     # pragma: no cover
+            cprint(f"Could not write protected preset '{name}': {exc}", "yellow")
+
+    # Presets from before the split lived directly in configs_trellis/. Move any that are
+    # not ours into the user folder so nobody loses their saved settings on upgrade.
+    try:
+        for entry in os.listdir(CONFIG_DIR):
+            if not entry.endswith(".json") or entry == os.path.basename(LAST_CONFIG_FILE):
+                continue
+            src = os.path.join(CONFIG_DIR, entry)
+            if not os.path.isfile(src):
+                continue
+            name = os.path.splitext(entry)[0]
+            if name in BUILTIN_PRESET_NAMES:
+                os.remove(src)                                     # superseded by the protected copy
+                continue
+            dst = os.path.join(PRESET_DIR_USER, entry)
+            if not os.path.exists(dst):
+                os.replace(src, dst)
+                cprint(f"[{stamp()}] Moved your preset '{name}' into presets_user/.", "cyan")
+    except OSError:
+        pass
+
+
+def is_builtin_preset(name: Optional[str]) -> bool:
+    return (name or "") in BUILTIN_PRESET_NAMES
+
+
+def user_preset_names() -> List[str]:
+    os.makedirs(PRESET_DIR_USER, exist_ok=True)
+    return sorted(os.path.splitext(f)[0] for f in os.listdir(PRESET_DIR_USER)
+                  if f.endswith(".json"))
+
+
 def get_config_list() -> List[str]:
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    configs = [os.path.splitext(f)[0] for f in os.listdir(CONFIG_DIR)
-               if f.endswith(".json") and f != os.path.basename(LAST_CONFIG_FILE)]
-    return sorted(configs) if configs else [DEFAULT_CONFIG_NAME]
+    """Protected presets first (in tier order), then the user's own."""
+    return BUILTIN_PRESET_NAMES + user_preset_names()
+
+
+def preset_path(name: str) -> Optional[str]:
+    for folder in (PRESET_DIR_BUILTIN, PRESET_DIR_USER):
+        candidate = os.path.join(folder, f"{name}.json")
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def read_preset(name: str) -> Optional[Dict[str, Any]]:
+    path = preset_path(name)
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else None
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
 def _ordered_values(config_data: Dict[str, Any]) -> List[Any]:
@@ -1265,7 +1554,11 @@ def _ordered_values(config_data: Dict[str, Any]) -> List[Any]:
 def _remember_last(config_name: str, config_data: Dict[str, Any]) -> None:
     try:
         with open(LAST_CONFIG_FILE, "w", encoding="utf-8") as fh:
-            json.dump({"last_config_name": config_name, "data": config_data}, fh, indent=4)
+            json.dump({
+                "last_config_name": config_name,
+                "last_was_user_preset": not is_builtin_preset(config_name),
+                "data": config_data,
+            }, fh, indent=4)
     except OSError:
         pass
 
@@ -1276,14 +1569,19 @@ def save_config(config_name: str, *values):
         return "Please type a preset name first.", gr.update(choices=get_config_list())
     if re.search(r"[\\/:*?\"<>|]", config_name):
         return "Preset name contains invalid characters.", gr.update(choices=get_config_list())
+    if is_builtin_preset(config_name):
+        return (f"'{config_name}' is a protected preset and cannot be overwritten. "
+                f"Pick another name — your presets are saved separately in presets_user/.",
+                gr.update(choices=get_config_list()))
 
     config_data = {key: val for key, val in zip(PRESET_KEYS, values)}
     try:
-        with open(os.path.join(CONFIG_DIR, f"{config_name}.json"), "w", encoding="utf-8") as fh:
+        os.makedirs(PRESET_DIR_USER, exist_ok=True)
+        with open(os.path.join(PRESET_DIR_USER, f"{config_name}.json"), "w", encoding="utf-8") as fh:
             json.dump(config_data, fh, indent=4)
         _remember_last(config_name, config_data)
-        cprint(f"[{stamp()}] Preset '{config_name}' saved.", "green")
-        return (f"Preset '{config_name}' saved.",
+        cprint(f"[{stamp()}] Preset '{config_name}' saved to presets_user/.", "green")
+        return (f"Preset '{config_name}' saved to presets_user/.",
                 gr.update(choices=get_config_list(), value=config_name))
     except Exception as exc:                                       # noqa: BLE001
         return f"Error saving preset: {exc}", gr.update(choices=get_config_list())
@@ -1295,26 +1593,24 @@ def load_config(config_name_to_load: Optional[str]):
         _remember_last(DEFAULT_CONFIG_NAME, defaults)
         return tuple(["Loaded built-in defaults."] + _ordered_values(defaults))
 
-    path = os.path.join(CONFIG_DIR, f"{config_name_to_load}.json")
-    if not os.path.exists(path):
-        return tuple([f"Preset '{config_name_to_load}' not found - loaded defaults."] + _ordered_values(defaults))
-
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            config_data = json.load(fh)
-    except (json.JSONDecodeError, OSError) as exc:
-        return tuple([f"Preset '{config_name_to_load}' is unreadable ({exc}) - loaded defaults."]
+    config_data = read_preset(config_name_to_load)
+    if config_data is None:
+        return tuple([f"Preset '{config_name_to_load}' could not be read - loaded defaults."]
                      + _ordered_values(defaults))
 
     _remember_last(config_name_to_load, config_data)
-    cprint(f"[{stamp()}] Preset '{config_name_to_load}' loaded.", "cyan")
-    return tuple([f"Preset '{config_name_to_load}' loaded."] + _ordered_values(config_data))
+    kind = "protected" if is_builtin_preset(config_name_to_load) else "your"
+    cprint(f"[{stamp()}] Loaded {kind} preset '{config_name_to_load}'.", "cyan")
+    return tuple([f"Loaded {kind} preset '{config_name_to_load}'."] + _ordered_values(config_data))
 
 
 def delete_config(config_name: Optional[str]):
     if not config_name:
         return "Select a preset to delete.", gr.update(choices=get_config_list())
-    path = os.path.join(CONFIG_DIR, f"{config_name}.json")
+    if is_builtin_preset(config_name):
+        return (f"'{config_name}' is protected and cannot be deleted.",
+                gr.update(choices=get_config_list()))
+    path = os.path.join(PRESET_DIR_USER, f"{config_name}.json")
     if not os.path.exists(path):
         return f"Preset '{config_name}' does not exist.", gr.update(choices=get_config_list())
     try:
@@ -1332,44 +1628,405 @@ def reset_to_defaults():
     return tuple(["Controls reset to the built-in defaults."] + _ordered_values(defaults))
 
 
-def initial_load_config():
-    """Restore whichever preset was used last. The dropdown value and the slider values
-    always come from the *same* file, so the dropdown's own change handler is a no-op."""
-    config_data = get_default_config_values()
-    last_config_name = DEFAULT_CONFIG_NAME
+def startup_preset_name() -> Tuple[str, str]:
+    """Which preset the app should come up with, and why.
 
-    default_path = os.path.join(CONFIG_DIR, f"{DEFAULT_CONFIG_NAME}.json")
-    if not os.path.exists(default_path):
-        try:
-            with open(default_path, "w", encoding="utf-8") as fh:
-                json.dump(config_data, fh, indent=4)
-        except OSError:
-            pass
+    A preset the user saved themselves always wins - if they went to the trouble of
+    saving one, re-applying a VRAM tier over the top of it would throw their work away.
+    Otherwise the tier that matches the detected card is used.
+    """
+    auto_tier = pick_vram_tier(GPU_VRAM_GB)
+    auto_name = vram_preset_name(auto_tier)
 
     if os.path.exists(LAST_CONFIG_FILE):
         try:
             with open(LAST_CONFIG_FILE, "r", encoding="utf-8") as fh:
-                saved_state = json.load(fh)
-            candidate = saved_state.get("last_config_name", DEFAULT_CONFIG_NAME)
-            if os.path.exists(os.path.join(CONFIG_DIR, f"{candidate}.json")):
-                last_config_name = candidate
+                saved = json.load(fh)
         except (OSError, json.JSONDecodeError):
-            pass
+            saved = {}
+        candidate = saved.get("last_config_name")
+        if candidate and not is_builtin_preset(candidate) and preset_path(candidate):
+            return candidate, f"restored your last preset '{candidate}'"
 
+    if GPU_VRAM_GB:
+        return auto_name, (f"auto-selected for {GPU_NAME} ({GPU_VRAM_GB:.1f} GB) "
+                           f"-> {auto_tier} GB tier")
+    return auto_name, "no GPU detected - using the 12 GB tier"
+
+
+def vram_info_html(preset_name: Optional[str]) -> str:
+    """The peak-VRAM card shown under the preset picker."""
+    esc = html_mod.escape
+    if GPU_VRAM_GB:
+        gpu_line = f"{esc(GPU_NAME or 'GPU')} &middot; {GPU_VRAM_GB:.1f} GB detected"
+    else:
+        gpu_line = "No NVIDIA GPU detected (nvidia-smi not available)"
+
+    tier = None
+    for candidate in VRAM_TIERS:
+        if preset_name == vram_preset_name(candidate):
+            tier = candidate
+            break
+
+    if tier is None:
+        values = read_preset(preset_name or "") or get_default_config_values()
+        prec = values.get("precision_val", cmd_args.precision)
+        # fp32 keeps the flexicubes grid in the mesh decoder at full width, which is the
+        # single biggest allocation in the whole app.
+        est = 12.2 if prec == "fp32" else 7.7
+        body = (f"<b>{esc(str(preset_name or 'Custom'))}</b> — not a VRAM tier. "
+                f"At <code>{esc(str(prec))}</code> precision expect a peak around "
+                f"<b>{est:.1f} GB</b>.")
+        return (f'<div class="tp-vram"><div class="tp-vram-gpu">{gpu_line}</div>'
+                f'<div class="tp-vram-body">{body}</div></div>')
+
+    spec = VRAM_PRESET_SPECS[tier]
+    values = spec["values"]
+    peak = spec["peak_gb"]
+    fits = (GPU_VRAM_GB is None) or (peak <= GPU_VRAM_GB + VRAM_TIER_MARGIN_GB)
+    klass = "tp-vram-ok" if fits else "tp-vram-warn"
+
+    rows = (f"precision <code>{esc(values['precision_val'])}</code> &middot; "
+            f"video {values['video_resolution_val']}px / {values['video_num_frames_val']} frames"
+            f"{' + geometry pass' if values['include_geometry_val'] else ''} &middot; "
+            f"texture {values['texture_size_val']}px &middot; "
+            f"bake {values['bake_resolution_val']}px × {values['bake_nviews_val']} views &middot; "
+            f"steps {values['ss_sampling_steps_val']}/{values['slat_sampling_steps_val']}"
+            f"{' &middot; isolated subprocess' if values.get('isolate_jobs_val') else ''}")
+
+    extra = ""
+    if spec.get("peak_glb_gb"):
+        extra = (f'<div class="tp-vram-warnline">⚠ GLB / mesh extraction peaks at about '
+                 f'<b>{spec["peak_glb_gb"]:.1f} GB</b> no matter how the sliders are set — '
+                 f'the mesh decoder builds a 256³ grid. On a {tier} GB card, stick to the '
+                 f'Gaussian splat and the preview video.</div>')
+    elif not fits:
+        extra = ('<div class="tp-vram-warnline">⚠ This preset needs more VRAM than the '
+                 'detected card has. Pick a lower tier.</div>')
+
+    return f"""
+<div class="tp-vram {klass}">
+  <div class="tp-vram-gpu">{gpu_line}</div>
+  <div class="tp-vram-peak">Peak VRAM <b>≈ {peak:.1f} GB</b> <span>of {tier} GB</span></div>
+  <div class="tp-vram-body">{rows}</div>
+  <div class="tp-vram-note">{esc(spec['note'])}</div>
+  {extra}
+</div>""".strip()
+
+
+def apply_vram_preset(tier_gb: int):
+    """Load one VRAM tier into every control, and select it in the preset dropdown."""
+    name = vram_preset_name(int(tier_gb))
+    values = read_preset(name) or vram_preset_values(int(tier_gb))
+    _remember_last(name, values)
+    cprint(f"[{stamp()}] Applied protected preset '{name}'.", "cyan")
+    return tuple([f"Applied '{name}'.", gr.update(value=name), vram_info_html(name)]
+                 + _ordered_values(values))
+
+
+def initial_load_config():
+    """Restore the preset the app should start with (see startup_preset_name)."""
+    name, why = startup_preset_name()
+    config_data = read_preset(name) or get_default_config_values()
     choices = get_config_list()
-    if last_config_name not in choices:
-        last_config_name = choices[0]
+    if name not in choices:
+        name = DEFAULT_CONFIG_NAME
+        config_data = read_preset(name) or get_default_config_values()
 
-    path = os.path.join(CONFIG_DIR, f"{last_config_name}.json")
-    if os.path.exists(path):
+    tier = pick_vram_tier(GPU_VRAM_GB)
+    cprint(f"[{stamp()}] UI ready - {why}.", "cyan")
+    return tuple([gr.update(choices=choices, value=name),
+                  gr.update(value=tier),
+                  vram_info_html(name)] + _ordered_values(config_data))
+
+
+# --------------------------------------------------------------------------------------
+# Isolated jobs (each run in its own process, so VRAM goes back to zero afterwards)
+# --------------------------------------------------------------------------------------
+# Why a whole process rather than `torch.cuda.empty_cache()`: emptying the cache returns
+# the allocator's blocks but leaves the CUDA context, the cuBLAS/cuDNN workspaces and
+# whatever spconv and flash-attn have cached - measured at 1.25 GB on an RTX 3090 and
+# 1.69 GB on an RTX 5090. Only tearing the process down gives that back, and on an 8 GB
+# card it is the difference between the next run fitting and not. It also means a preset
+# can pick fp16 or fp32 per run without restarting the server, and an out-of-memory kill
+# takes the child down instead of the web UI.
+WORKER_PROGRESS_PREFIX = "@@TRELLIS@@ "
+
+
+def _worker_emit(kind: str, **payload) -> None:
+    """Called inside the child process: one JSON event per line on stdout.
+
+    The child's stderr is merged into the same pipe, and tqdm draws its bars there with
+    a bare \\r and no newline - so an event written plainly would be glued onto the end
+    of a half-drawn bar and never parse. The leading newline guarantees the marker starts
+    a line, and writing the whole thing in one call keeps it atomic in the pipe.
+    """
+    sys.stdout.write("\n" + WORKER_PROGRESS_PREFIX + json.dumps({"kind": kind, **payload}) + "\n")
+    sys.stdout.flush()
+
+
+class _WorkerJobProxy(JobState):
+    """A JobState whose updates are forwarded to the parent instead of a browser."""
+
+    #  Rendering 240 frames fires a tqdm update per frame; at one pipe write each that is
+    #  pure overhead, since the parent only repaints the browser every GEN_POLL seconds.
+    BAR_MIN_INTERVAL = 0.15
+
+    def __init__(self, title: str = "Working"):
+        super().__init__(title)
+        self._suppress_log = False
+        self._last_bar_emit = 0.0
+
+    def log(self, msg: str, level: str = "info", console: bool = True) -> None:
+        # console=False: the parent prints every forwarded line itself, and the child's
+        # stdout is piped into the parent, so echoing here would double every log line.
+        super().log(msg, level=level, console=False)
+        if not self._suppress_log:
+            _worker_emit("log", msg=msg, level=level)
+
+    def stage(self, name: str, index: Optional[int] = None, bars: int = 1) -> None:
+        # JobState.stage() logs "> Step i/n" using the child's own plan, which is not the
+        # plan the parent is tracking. Swallow that line and let the parent write its own.
+        self._suppress_log = True
         try:
-            with open(path, "r", encoding="utf-8") as fh:
-                config_data = json.load(fh)
-        except (OSError, json.JSONDecodeError):
-            pass
+            super().stage(name, index=index, bars=bars)
+        finally:
+            self._suppress_log = False
+        # No index is sent: the child counts its own stages from 1, while the parent is
+        # tracking a plan that spans several child processes. The parent just advances.
+        _worker_emit("stage", name=name, bars=bars)
 
-    cprint(f"[{stamp()}] UI ready - restored preset '{last_config_name}'.", "cyan")
-    return tuple([gr.update(choices=choices, value=last_config_name)] + _ordered_values(config_data))
+    def bar_start(self, desc: str, total: Optional[int]) -> None:
+        super().bar_start(desc, total)
+        self._last_bar_emit = 0.0
+        _worker_emit("bar_start", desc=desc or "", total=int(total or 0))
+
+    def bar_update(self, n: int, total: Optional[int], rate: Optional[float]) -> None:
+        super().bar_update(n, total, rate)
+        now = time.time()
+        final = bool(total) and int(n or 0) >= int(total)
+        if final or now - self._last_bar_emit >= self.BAR_MIN_INTERVAL:
+            self._last_bar_emit = now
+            _worker_emit("bar", n=int(n or 0), total=int(total or 0), rate=rate)
+
+    def set_detail(self, text: str) -> None:
+        super().set_detail(text)
+        _worker_emit("detail", text=text)
+
+    def set_headline(self, text: str) -> None:
+        super().set_headline(text)
+        _worker_emit("headline", text=text)
+
+
+def state_to_disk(state: dict, path: str) -> str:
+    """Persist a packed generation state so another process can pick it up."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    flat: Dict[str, Any] = {}
+    meta: Dict[str, Any] = {"filename_base": state.get("filename_base", "")}
+    if state.get("custom_output_dirs"):
+        meta["custom_output_dirs"] = state["custom_output_dirs"]
+    for group in ("gaussian", "mesh"):
+        for key, value in state[group].items():
+            if isinstance(value, np.ndarray):
+                flat[f"{group}.{key}"] = value
+            else:
+                meta[f"{group}.{key}"] = value
+    np.savez(path, __meta__=np.frombuffer(json.dumps(meta).encode("utf-8"), dtype=np.uint8), **flat)
+    return path
+
+
+def state_from_disk(path: str) -> dict:
+    with np.load(path, allow_pickle=False) as data:
+        meta = json.loads(bytes(data["__meta__"]).decode("utf-8"))
+        state: Dict[str, Any] = {"gaussian": {}, "mesh": {}}
+        for key in data.files:
+            if key == "__meta__":
+                continue
+            group, _, field = key.partition(".")
+            state[group][field] = data[key]
+    for key, value in meta.items():
+        group, _, field = key.partition(".")
+        if group in ("gaussian", "mesh") and field:
+            state[group][field] = value
+        else:
+            state[key] = value
+    return state
+
+
+def _worker_argv(job_path: str) -> List[str]:
+    argv = [sys.executable, os.path.abspath(__file__), "--worker", job_path]
+    if cmd_args.attention:
+        argv += ["--attention", cmd_args.attention]
+    if cmd_args.xformers:
+        argv.append("--xformers")
+    if cmd_args.highvram:
+        argv.append("--highvram")
+    if cmd_args.no_tf32:
+        argv.append("--no-tf32")
+    return argv
+
+
+def run_isolated(job: JobState, kind: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Run one unit of work in a child process and mirror its progress into `job`.
+
+    Returns the child's result dict. Raises on failure so the caller's normal error
+    path reports it, and translates a cancel into JobCancelled.
+    """
+    token = f"{int(time.time() * 1000)}_{os.getpid()}"
+    job_path = os.path.join(JOB_TMP_DIR, f"job_{token}.json")
+    result_path = os.path.join(JOB_TMP_DIR, f"result_{token}.json")
+    with open(job_path, "w", encoding="utf-8") as fh:
+        json.dump({"kind": kind, "payload": payload, "result_path": result_path}, fh)
+
+    job.log(f"Starting an isolated worker process ({kind}) - VRAM returns to zero when it exits.")
+    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
+    proc = subprocess.Popen(
+        _worker_argv(job_path), cwd=APP_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace", bufsize=1, creationflags=creationflags,
+    )
+
+    def watch_cancel():
+        while proc.poll() is None:
+            if job.cancel_event.wait(0.25):
+                try:
+                    proc.terminate()
+                except OSError:                                    # pragma: no cover
+                    pass
+                return
+
+    threading.Thread(target=watch_cancel, name="trellis-worker-cancel", daemon=True).start()
+
+    tail: List[str] = []
+    try:
+        for line in proc.stdout:                                   # type: ignore[union-attr]
+            line = line.rstrip("\n")
+            # The marker is written at the start of its own line, but a stray \r-drawn
+            # tqdm fragment can still share the buffer, so search rather than match.
+            marker = line.find(WORKER_PROGRESS_PREFIX)
+            if marker >= 0:
+                before = line[:marker].rsplit("\r", 1)[-1].strip()
+                if before:
+                    cprint(f"  │ {before}", "dim")
+                try:
+                    evt = json.loads(line[marker + len(WORKER_PROGRESS_PREFIX):])
+                except json.JSONDecodeError:                       # pragma: no cover
+                    continue
+                kind_ = evt.get("kind")
+                if kind_ == "log":
+                    JobState.log(job, evt.get("msg", ""), level=evt.get("level", "info"))
+                elif kind_ == "stage":
+                    JobState.stage(job, evt.get("name", ""), bars=int(evt.get("bars", 1) or 1))
+                elif kind_ == "bar_start":
+                    JobState.bar_start(job, evt.get("desc", ""), evt.get("total"))
+                elif kind_ == "bar":
+                    JobState.bar_update(job, evt.get("n", 0), evt.get("total"), evt.get("rate"))
+                elif kind_ == "detail":
+                    JobState.set_detail(job, evt.get("text", ""))
+                elif kind_ == "headline":
+                    JobState.set_headline(job, evt.get("text", ""))
+            elif line.strip():
+                # tqdm redraws with \r and only terminates the line when the bar closes,
+                # so one "line" can hold a whole bar's history - show just the final state.
+                shown = line.rsplit("\r", 1)[-1].strip()
+                if shown:
+                    cprint(f"  │ {shown}", "dim")
+                tail.append(shown or line)
+                del tail[:-40]
+    finally:
+        proc.stdout.close()                                        # type: ignore[union-attr]
+        code = proc.wait()
+
+    if job.cancelled:
+        raise JobCancelled("Cancelled by user.")
+
+    if code != 0 or not os.path.exists(result_path):
+        detail = "\n".join(tail[-15:]) or f"exit code {code}"
+        raise RuntimeError(f"The isolated worker failed (exit {code}).\n{detail}")
+
+    with open(result_path, "r", encoding="utf-8") as fh:
+        result = json.load(fh)
+    for path in (job_path, result_path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    if result.get("error"):
+        raise RuntimeError(result["error"])
+    if result.get("peak_vram_gb"):
+        job.log(f"  Worker peak VRAM: {result['peak_vram_gb']:.2f} GB "
+                f"(process has exited - the GPU is idle again)", level="ok")
+    return result
+
+
+def worker_main(job_path: str) -> int:
+    """Entry point of the child process (``--worker <jobfile>``)."""
+    with open(job_path, "r", encoding="utf-8") as fh:
+        spec = json.load(fh)
+    kind = spec["kind"]
+    payload = spec["payload"]
+    result_path = spec["result_path"]
+
+    job = _WorkerJobProxy(kind)
+    _set_thread_job(job)
+    out: Dict[str, Any] = {}
+    peak_sampler_stop = threading.Event()
+    peak = {"gb": 0.0}
+
+    try:
+        job.stage("Preparing the engine")
+        ENGINE.ensure(job, precision=payload.get("precision"))
+        job.stage_done()
+
+        torch = ENGINE.torch
+        if torch is not None and torch.cuda.is_available():
+            def sample_peak():
+                while not peak_sampler_stop.is_set():
+                    try:
+                        free, total = torch.cuda.mem_get_info()
+                        used = (total - free) / 1024 ** 3
+                        if used > peak["gb"]:
+                            peak["gb"] = used
+                    except Exception:                              # pragma: no cover
+                        return
+                    time.sleep(0.05)
+            threading.Thread(target=sample_peak, daemon=True).start()
+
+        if kind == "generate":
+            kwargs = dict(payload["kwargs"])
+            # The parent could only hand us file paths; generate_one's _ensure_pil opens
+            # a str straight into a PIL image, so map them back onto its real arguments.
+            kwargs["image"] = kwargs.pop("image_path", None)
+            kwargs["multiimages"] = kwargs.pop("multiimage_paths", None)
+            state, video_path = generate_one(job, **kwargs)
+            state_path = payload["state_path"]
+            state_to_disk(state, state_path)
+            out = {"state_path": state_path, "video": video_path,
+                   "filename_base": state.get("filename_base")}
+        elif kind == "extract_glb":
+            state = state_from_disk(payload["state_path"])
+            out = {"glb": extract_glb_file(job, state, **payload["kwargs"])}
+        elif kind == "extract_gaussian":
+            state = state_from_disk(payload["state_path"])
+            out = {"gs": extract_gaussian_file(job, state)}
+        else:
+            raise ValueError(f"Unknown worker job kind: {kind!r}")
+    except JobCancelled:
+        out = {"error": "Cancelled by user."}
+    except BaseException as exc:                                   # noqa: BLE001
+        traceback.print_exc()
+        out = {"error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        peak_sampler_stop.set()
+        _set_thread_job(None)
+
+    out["peak_vram_gb"] = round(peak["gb"], 3)
+    try:
+        with open(result_path, "w", encoding="utf-8") as fh:
+            json.dump(out, fh)
+    except OSError as exc:                                         # pragma: no cover
+        cprint(f"Worker could not write its result file: {exc}", "red")
+        return 1
+    return 1 if out.get("error") else 0
 
 
 # --------------------------------------------------------------------------------------
@@ -1495,6 +2152,115 @@ def load_multi_example(case: Optional[str]):
     return paths, False
 
 
+# --------------------------------------------------------------------------------------
+# One entry point per operation, so the in-process and isolated paths never diverge
+# --------------------------------------------------------------------------------------
+def _new_job_tmp(suffix: str) -> str:
+    os.makedirs(JOB_TMP_DIR, exist_ok=True)
+    return os.path.join(JOB_TMP_DIR, f"{int(time.time() * 1000)}_{os.getpid()}_{suffix}")
+
+
+def _stash_images_for_worker(image, multiimages, is_multiimage) -> Dict[str, Any]:
+    """A child process cannot be handed PIL objects, so put the pixels on disk."""
+    from PIL import Image as PILImage                              # cheap, pillow is already up
+    if is_multiimage:
+        paths = []
+        for idx, item in enumerate(multiimages or []):
+            raw = item[0] if isinstance(item, (tuple, list)) else item
+            if isinstance(raw, str):
+                paths.append(raw)
+                continue
+            path = _new_job_tmp(f"view{idx:02d}.png")
+            (raw if isinstance(raw, PILImage.Image) else PILImage.fromarray(raw)).save(path)
+            paths.append(path)
+        return {"multiimage_paths": paths, "image_path": None}
+    if isinstance(image, str):
+        return {"image_path": image, "multiimage_paths": None}
+    path = _new_job_tmp("input.png")
+    (image if isinstance(image, PILImage.Image) else PILImage.fromarray(image)).save(path)
+    return {"image_path": path, "multiimage_paths": None}
+
+
+def state_ref(value) -> Tuple[Optional[dict], Optional[str]]:
+    """Unpack whatever is sitting in the output gr.State into (state dict, npz path)."""
+    if not value:
+        return None, None
+    if isinstance(value, dict) and "__state_path__" in value:
+        return None, value["__state_path__"]
+    return value, None
+
+
+def _materialise_state(value) -> dict:
+    state, path = state_ref(value)
+    if state is not None:
+        return state
+    if path and os.path.exists(path):
+        return state_from_disk(path)
+    raise RuntimeError("The generation result is no longer available - please generate again.")
+
+
+def _discard_state_file(value) -> None:
+    """Delete the .npz handed between processes, if this state has one."""
+    _, path = state_ref(value)
+    if path:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _state_on_disk(value) -> str:
+    state, path = state_ref(value)
+    if path and os.path.exists(path):
+        return path
+    if state is None:
+        raise RuntimeError("The generation result is no longer available - please generate again.")
+    return state_to_disk(state, _new_job_tmp("state.npz"))
+
+
+def do_generate(job: JobState, *, isolate: bool, precision: str, image, multiimages,
+                is_multiimage: bool, **kwargs):
+    """Generate one asset. Returns (state-or-ref, video path)."""
+    if not isolate:
+        ENGINE.ensure(job, precision=precision)
+        state, video_path = generate_one(job, image=image, multiimages=multiimages,
+                                         is_multiimage=is_multiimage, **kwargs)
+        return state, video_path
+
+    state_path = _new_job_tmp("state.npz")
+    payload = {
+        "precision": precision,
+        "state_path": state_path,
+        "kwargs": {**kwargs, **_stash_images_for_worker(image, multiimages, is_multiimage),
+                   "is_multiimage": bool(is_multiimage)},
+    }
+    result = run_isolated(job, "generate", payload)
+    ref = {"__state_path__": result["state_path"], "filename_base": result.get("filename_base")}
+    return ref, result.get("video")
+
+
+def do_extract_glb(job: JobState, state_value, *, isolate: bool, precision: str,
+                   mesh_simplify, texture_size, save_metadata, bake_resolution, bake_nviews) -> str:
+    kwargs = {"mesh_simplify": float(mesh_simplify), "texture_size": int(texture_size),
+              "save_metadata": bool(save_metadata), "bake_resolution": int(bake_resolution),
+              "bake_nviews": int(bake_nviews)}
+    if not isolate:
+        ENGINE.ensure(job, precision=precision)
+        return extract_glb_file(job, _materialise_state(state_value), **kwargs)
+    result = run_isolated(job, "extract_glb", {
+        "precision": precision, "state_path": _state_on_disk(state_value), "kwargs": kwargs})
+    return result["glb"]
+
+
+def do_extract_gaussian(job: JobState, state_value, *, isolate: bool, precision: str) -> str:
+    if not isolate:
+        ENGINE.ensure(job, precision=precision)
+        return extract_gaussian_file(job, _materialise_state(state_value))
+    result = run_isolated(job, "extract_gaussian", {
+        "precision": precision, "state_path": _state_on_disk(state_value)})
+    return result["gs"]
+
+
 def run_generation(
     do_extract: bool,
     num_generations, image, multiimages, is_multiimage, image_is_clean,
@@ -1502,6 +2268,7 @@ def run_generation(
     ss_guidance, ss_steps, slat_guidance, slat_steps, multiimage_algo,
     video_resolution, video_frames, video_fps, video_quality, include_geometry,
     save_metadata, mesh_simplify, texture_size,
+    bake_resolution, bake_nviews, precision, isolate_jobs,
 ):
     """Streaming handler used by both generate buttons."""
     n_out = 9   # state, video, model, dl_glb, dl_gs, btn_glb, btn_gs, status, log
@@ -1522,9 +2289,14 @@ def run_generation(
                idle_status_html("Waiting for gallery images."), "Gallery is empty.")
         return
 
+    isolate = bool(isolate_jobs)
+    precision = precision if precision in ("fp16", "fp32") else cmd_args.precision
     per_gen_stages = 4 + (2 if do_extract else 0)
     job = JobState("Generation")
-    job.set_plan(1 + per_gen_stages * num_gens)
+    # In isolated mode each operation spawns its own process, and each of those reports a
+    # "Preparing the engine" stage of its own, so the plan has to make room for them.
+    engine_stages = (1 + (2 if do_extract else 0)) * num_gens if isolate else 1
+    job.set_plan(engine_stages + per_gen_stages * num_gens)
     job.set_headline(f"{num_gens} generation(s)" + (" + extraction" if do_extract else ""))
     register_job("generate", job)
 
@@ -1532,9 +2304,10 @@ def run_generation(
 
     def worker():
         _set_thread_job(job)
-        job.stage("Preparing the engine")
-        ENGINE.ensure(job)
-        job.stage_done()
+        if not isolate:
+            job.stage("Preparing the engine")
+            ENGINE.ensure(job, precision=precision)
+            job.stage_done()
 
         base_prefix = None
         reservation = None
@@ -1565,8 +2338,8 @@ def run_generation(
                 prefix = f"{base_prefix}_{i + 1:04d}" if base_prefix else None
                 job.set_headline(f"Generation {i + 1}/{num_gens} · seed {seed_for_iter}")
 
-                state, video_path = generate_one(
-                    job,
+                state, video_path = do_generate(
+                    job, isolate=isolate, precision=precision,
                     image=image, multiimages=multiimages, is_multiimage=bool(is_multiimage),
                     image_is_clean=bool(image_is_clean), seed=seed_for_iter,
                     ss_guidance_strength=ss_guidance, ss_sampling_steps=ss_steps,
@@ -1584,9 +2357,14 @@ def run_generation(
 
                 if do_extract:
                     job.raise_if_cancelled()
-                    results["glb"] = extract_glb_file(job, state, mesh_simplify, texture_size, save_metadata)
+                    results["glb"] = do_extract_glb(
+                        job, state, isolate=isolate, precision=precision,
+                        mesh_simplify=mesh_simplify, texture_size=texture_size,
+                        save_metadata=save_metadata, bake_resolution=bake_resolution,
+                        bake_nviews=bake_nviews)
                     job.raise_if_cancelled()
-                    results["gs"] = extract_gaussian_file(job, state)
+                    results["gs"] = do_extract_gaussian(job, state, isolate=isolate,
+                                                        precision=precision)
 
                 took = time.time() - t_gen
                 gen_times.append(took)
@@ -1637,12 +2415,15 @@ def run_generation(
     )
 
 
-def run_extract_glb(state, mesh_simplify, texture_size, save_metadata):
+def run_extract_glb(state, mesh_simplify, texture_size, save_metadata,
+                    bake_resolution, bake_nviews, precision, isolate_jobs):
     if not state:
         gr.Warning("Generate something first.")
         yield gr.skip(), gr.skip(), idle_status_html("Nothing to extract yet."), "No generation in memory."
         return
 
+    isolate = bool(isolate_jobs)
+    precision = precision if precision in ("fp16", "fp32") else cmd_args.precision
     job = JobState("GLB extraction")
     job.set_plan(2)
     register_job("generate", job)
@@ -1651,10 +2432,11 @@ def run_extract_glb(state, mesh_simplify, texture_size, save_metadata):
     def worker():
         _set_thread_job(job)
         try:
-            job.stage("Preparing the engine")
-            ENGINE.ensure(job)
-            job.stage_done()
-            out["glb"] = extract_glb_file(job, state, mesh_simplify, texture_size, save_metadata)
+            out["glb"] = do_extract_glb(
+                job, state, isolate=isolate, precision=precision,
+                mesh_simplify=mesh_simplify, texture_size=texture_size,
+                save_metadata=save_metadata, bake_resolution=bake_resolution,
+                bake_nviews=bake_nviews)
         finally:
             _set_thread_job(None)
 
@@ -1680,12 +2462,14 @@ def run_extract_glb(state, mesh_simplify, texture_size, save_metadata):
            html, log_text)
 
 
-def run_extract_gaussian(state):
+def run_extract_gaussian(state, precision, isolate_jobs):
     if not state:
         gr.Warning("Generate something first.")
         yield gr.skip(), gr.skip(), idle_status_html("Nothing to extract yet."), "No generation in memory."
         return
 
+    isolate = bool(isolate_jobs)
+    precision = precision if precision in ("fp16", "fp32") else cmd_args.precision
     job = JobState("Gaussian extraction")
     job.set_plan(2)
     register_job("generate", job)
@@ -1694,10 +2478,7 @@ def run_extract_gaussian(state):
     def worker():
         _set_thread_job(job)
         try:
-            job.stage("Preparing the engine")
-            ENGINE.ensure(job)
-            job.stage_done()
-            out["gs"] = extract_gaussian_file(job, state)
+            out["gs"] = do_extract_gaussian(job, state, isolate=isolate, precision=precision)
         finally:
             _set_thread_job(None)
 
@@ -1741,7 +2522,7 @@ def run_batch_processing(
     gen_video_cb, extract_glb_cb, extract_gs_cb,
     seed, randomize_seed, ss_guidance, ss_steps, slat_guidance, slat_steps, multiimage_algo,
     mesh_simplify, texture_size, video_resolution, video_frames, video_fps, video_quality,
-    include_geometry, save_metadata,
+    include_geometry, save_metadata, bake_resolution, bake_nviews, precision, isolate_jobs,
 ):
     batch_input_dir = (batch_input_dir or "").strip()
     if not batch_input_dir or not os.path.isdir(batch_input_dir):
@@ -1771,12 +2552,17 @@ def run_batch_processing(
     for path in [batch_root, *custom_dirs.values()]:
         os.makedirs(path, exist_ok=True)
 
+    isolate = bool(isolate_jobs)
+    precision = precision if precision in ("fp16", "fp32") else cmd_args.precision
     total_iterations = len(all_files) * num_gens_per_image
     # prepare image, sample, render video, write video (+ optional extractions)
     per_item_stages = 4 + (1 if extract_glb_cb else 0) + (1 if extract_gs_cb else 0)
+    if isolate:
+        # every isolated operation announces its own engine stage
+        per_item_stages += 1 + (1 if extract_glb_cb else 0) + (1 if extract_gs_cb else 0)
 
     job = JobState("Batch")
-    job.set_plan(1 + per_item_stages * total_iterations)
+    job.set_plan((0 if isolate else 1) + per_item_stages * total_iterations)
     job.set_headline(f"{len(all_files)} image(s) × {num_gens_per_image} generation(s)")
     register_job("batch", job)
 
@@ -1787,9 +2573,10 @@ def run_batch_processing(
     def worker():
         _set_thread_job(job)
         try:
-            job.stage("Preparing the engine")
-            ENGINE.ensure(job)
-            job.stage_done()
+            if not isolate:
+                job.stage("Preparing the engine")
+                ENGINE.ensure(job, precision=precision)
+                job.stage_done()
             banner(f"BATCH START - {len(all_files)} images x {num_gens_per_image} gen(s) "
                    f"= {total_iterations} iterations", "magenta")
             job.log(f"Input : {batch_input_dir}")
@@ -1827,9 +2614,11 @@ def run_batch_processing(
                     try:
                         seed_for_iter = (get_seed(True, 0) if randomize_seed
                                          else (seed_for_file + iteration) % MAX_SEED)
-                        raw = ENGINE.Image.open(image_path).convert("RGBA")
-                        state, video_path = generate_one(
-                            job,
+                        # In isolated mode the worker opens the file itself, so hand it the
+                        # path rather than decoding the image twice.
+                        raw = image_path if isolate else ENGINE.Image.open(image_path).convert("RGBA")
+                        state, video_path = do_generate(
+                            job, isolate=isolate, precision=precision,
                             image=raw, multiimages=None, is_multiimage=False, image_is_clean=False,
                             seed=seed_for_iter,
                             ss_guidance_strength=ss_guidance, ss_sampling_steps=ss_steps,
@@ -1844,12 +2633,21 @@ def run_batch_processing(
                             custom_output_dirs=custom_dirs,
                         )
 
-                        if extract_glb_cb:
-                            job.raise_if_cancelled()
-                            extract_glb_file(job, state, mesh_simplify, texture_size, save_metadata)
-                        if extract_gs_cb:
-                            job.raise_if_cancelled()
-                            extract_gaussian_file(job, state)
+                        try:
+                            if extract_glb_cb:
+                                job.raise_if_cancelled()
+                                do_extract_glb(job, state, isolate=isolate, precision=precision,
+                                               mesh_simplify=mesh_simplify, texture_size=texture_size,
+                                               save_metadata=save_metadata,
+                                               bake_resolution=bake_resolution,
+                                               bake_nviews=bake_nviews)
+                            if extract_gs_cb:
+                                job.raise_if_cancelled()
+                                do_extract_gaussian(job, state, isolate=isolate, precision=precision)
+                        finally:
+                            # A batch run never revisits an item, so the handoff file for an
+                            # isolated generation would otherwise pile up on disk.
+                            _discard_state_file(state)
 
                         stats["processed"] += 1
                         durations.append(time.time() - t_item)
@@ -1913,10 +2711,13 @@ def system_info_markdown() -> str:
         ("Platform", f"{platform.system()} {platform.release()}"),
         ("Attention backend", f"{ATTENTION_BACKEND} — {_ATTENTION_NOTE}"),
         ("Sparse backend", os.environ.get("SPARSE_BACKEND", "spconv")),
-        ("Precision", cmd_args.precision),
+        ("Precision", f"{ENGINE.precision} (from the active preset; --precision "
+                      f"{cmd_args.precision} at launch)"),
         ("High-VRAM mode", "on" if cmd_args.highvram else "off"),
         ("TF32", "off (--no-tf32)" if cmd_args.no_tf32 else "on"),
         ("Engine", ENGINE.status_line()),
+        ("Detected GPU", f"{GPU_NAME} — {GPU_VRAM_GB:.1f} GB → {pick_vram_tier(GPU_VRAM_GB)} GB tier"
+                         if GPU_VRAM_GB else "nvidia-smi reported nothing"),
     ]
     if ENGINE.torch is not None:
         torch = ENGINE.torch
@@ -2018,7 +2819,16 @@ _BTN_CSS = "\n".join(
 )
 
 CUSTOM_CSS = """
-.gradio-container { max-width: 1680px !important; }
+/* fill_width=True is what gives the two output columns room to breathe, but it also turns
+   off Gradio's own centering: .fillable only gets its responsive max-width (and the auto
+   margins that go with it) while :not(.fill_width). The cap below therefore has to bring
+   its own centering, or the whole app sits flush against the left edge on any display
+   wider than the cap. */
+.gradio-container {
+  max-width: 1680px !important;
+  margin-left: auto !important;
+  margin-right: auto !important;
+}
 
 /* ---------- header ---------- */
 #tp-header {
@@ -2103,6 +2913,32 @@ CUSTOM_CSS = """
   font-size: 11.5px !important; line-height: 1.45 !important;
 }
 
+/* ---------- VRAM preset panel ---------- */
+#tp-vram-box {
+  border: 1px solid var(--border-color-primary); border-radius: 14px;
+  padding: 10px 12px 4px 12px; margin-bottom: 10px;
+  background: linear-gradient(140deg, rgba(79,70,229,.10) 0%, rgba(6,182,212,.08) 100%);
+}
+#tp-vram-box h3 { margin: 0 0 6px 0 !important; font-size: 1.0rem; }
+#tp-vram-info > * { margin: 0 !important; }
+.tp-vram {
+  border-radius: 10px; padding: 10px 12px; font-size: .84rem;
+  border: 1px solid var(--border-color-primary);
+  background: var(--background-fill-secondary);
+}
+.tp-vram-gpu { font-size: .78rem; opacity: .75; margin-bottom: 4px; }
+.tp-vram-peak { font-size: 1.02rem; font-weight: 700; margin-bottom: 6px; }
+.tp-vram-peak span { font-weight: 500; opacity: .6; font-size: .84rem; }
+.tp-vram-ok   .tp-vram-peak { color: #10b981; }
+.tp-vram-warn .tp-vram-peak { color: #f43f5e; }
+.tp-vram-body { line-height: 1.55; opacity: .9; }
+.tp-vram-body code { font-size: .8rem; }
+.tp-vram-note { margin-top: 6px; font-size: .79rem; opacity: .72; }
+.tp-vram-warnline {
+  margin-top: 8px; padding: 7px 9px; border-radius: 8px; font-size: .79rem;
+  background: rgba(217,119,6,.14); border: 1px solid rgba(217,119,6,.4);
+}
+
 /* ---------- misc polish ---------- */
 .tp-card {
   border: 1px solid var(--border-color-primary); border-radius: 14px;
@@ -2120,7 +2956,7 @@ footer { display: none !important; }
 # but Chrome still blocks autoplay unless the element is explicitly muted. Gradio reuses
 # one <video> element and only swaps its `src`, so a childList observer never sees the
 # new clip - capture-phase media events (which do not bubble) are the reliable hook.
-HEAD_HTML = """
+HEAD_HTML = r"""
 <link rel="icon" type="image/svg+xml" href="/favicon.ico">
 <script>
 (function () {
@@ -2152,6 +2988,83 @@ HEAD_HTML = """
   setInterval(sweep, 600);
   document.addEventListener("DOMContentLoaded", sweep);
 })();
+
+(function () {
+  // Brighten the GLB preview.
+  //
+  // gr.Model3D renders glTF through the Babylon viewer, whose default environment sits at
+  // intensity 1.0 -- correct for a photographic asset, far too dim for our baked-albedo
+  // meshes, which end up much darker than the colour half of the turntable clip. Babylon
+  // exposes viewer.environmentConfig, but Gradio 6 offers no way to reach it from Python,
+  // so patch the viewer prototype instead. Everything here is best-effort: if a Gradio or
+  // Babylon upgrade moves any of it, the patch quietly does nothing and the preview simply
+  // stays at stock brightness.
+  var INTENSITY = 2.4;   // ~1.8x mean luminance, still under 1% clipped highlights
+  var boosted = new WeakSet();
+  var patched = false;
+
+  function boost(viewer) {
+    if (!viewer || boosted.has(viewer)) return;
+    boosted.add(viewer);                       // before the write: setting the config marks
+    try {                                      // the scene dirty, which re-enters the hook
+      var cfg = viewer.environmentConfig;
+      if (cfg && typeof cfg.intensity === "number") {
+        viewer.environmentConfig = Object.assign({}, cfg, { intensity: INTENSITY });
+      }
+    } catch (e) {}
+  }
+
+  function patch(Viewer) {
+    var proto = Viewer.prototype;
+
+    // Normal path: every model Gradio shows arrives through loadModel.
+    var load = proto.loadModel;
+    if (typeof load === "function") {
+      proto.loadModel = function () {
+        var r = load.apply(this, arguments);
+        var self = this;
+        if (r && r.then) return r.then(function (v) { boost(self); return v; });
+        boost(self);
+        return r;
+      };
+    }
+
+    // Fallback for a viewer built before this patch landed: _shouldRender is read once per
+    // frame, so an in-flight load still gets caught on its next redraw.
+    var d = Object.getOwnPropertyDescriptor(proto, "_shouldRender");
+    if (d && d.get && d.configurable) {
+      var get = d.get;
+      Object.defineProperty(proto, "_shouldRender", {
+        configurable: true,
+        enumerable: d.enumerable,
+        get: function () { boost(this); return get.call(this); },
+      });
+    }
+  }
+
+  // The Babylon bundle is a hashed, lazily imported chunk, so it can only be found once the
+  // browser has fetched it. Resource timings list it only after that, which means import()
+  // here always hits the module cache rather than costing another download. Poll often: the
+  // window between that fetch and the first loadModel is short, and losing the race only
+  // falls back to the per-frame hook.
+  var tried = {};
+  var timer = setInterval(look, 150);
+
+  function look() {
+    if (patched) { clearInterval(timer); return; }
+    performance.getEntriesByType("resource").forEach(function (entry) {
+      var url = entry.name;
+      if (tried[url] || !/\/assets\/index-[^/]*\.js$/.test(url)) return;
+      tried[url] = true;
+      import(url).then(function (mod) {
+        if (patched || !mod || !mod.cx || typeof mod.cx.Viewer !== "function") return;
+        patched = true;
+        patch(mod.cx.Viewer);
+      }).catch(function () {});
+    });
+  }
+  document.addEventListener("DOMContentLoaded", look);
+})();
 </script>
 """
 
@@ -2165,8 +3078,8 @@ HEADER_HTML = f"""
   <div class="tp-chips">
     <span class="tp-chip">core {code_version}</span>
     <span class="tp-chip">attention: {ATTENTION_BACKEND}</span>
-    <span class="tp-chip">precision: {cmd_args.precision}</span>
     <span class="tp-chip">{'high-VRAM' if cmd_args.highvram else 'model offloading'}</span>
+    <span class="tp-chip">{(GPU_NAME + f' · {GPU_VRAM_GB:.1f} GB') if GPU_VRAM_GB else 'no GPU detected'}</span>
   </div>
 </div>
 """
@@ -2239,6 +3152,29 @@ def build_ui() -> gr.Blocks:
                             gen_log = gr.Textbox(label=None, show_label=False, lines=12, max_lines=20,
                                                  interactive=False, autoscroll=True, elem_id="tp-gen-log")
 
+                        # ---------------- VRAM presets (above Generation settings) ----
+                        with gr.Group(elem_id="tp-vram-box"):
+                            gr.Markdown("### 🎛️  VRAM preset")
+                            vram_tier_radio = gr.Radio(
+                                choices=[(f"{t} GB", t) for t in VRAM_TIERS],
+                                value=pick_vram_tier(GPU_VRAM_GB),
+                                label="Pick the tier that matches your GPU",
+                                info="Auto-selected from the detected card on start. Every tier "
+                                     "sets precision, sampling steps, video and extraction "
+                                     "quality together.",
+                            )
+                            vram_info = gr.HTML(vram_info_html(vram_preset_name(pick_vram_tier(GPU_VRAM_GB))),
+                                                elem_id="tp-vram-info")
+                            with gr.Row(elem_classes=["tp-actions"]):
+                                precision_radio = gr.Radio(
+                                    ["fp32", "fp16"], value=cmd_args.precision, label="Model precision",
+                                    info="fp16 roughly halves the mesh decoder's peak (12.1 → 7.7 GB). "
+                                         "Changing it rebuilds the pipeline once.")
+                                isolate_jobs_checkbox = gr.Checkbox(
+                                    label="Run each job in its own process", value=False,
+                                    info="Frees the CUDA context (1.2–1.7 GB) between runs instead of "
+                                         "just the tensor cache. Costs one model load per job.")
+
                         with gr.Accordion("Generation settings", open=True):
                             with gr.Row():
                                 seed_slider = gr.Slider(0, MAX_SEED, label="Seed", value=0, step=1)
@@ -2309,6 +3245,14 @@ def build_ui() -> gr.Blocks:
                             texture_size_slider = gr.Slider(
                                 512, 2048, label="Texture size (px)", value=1024, step=512,
                                 info="Resolution of the baked texture.")
+                            with gr.Row():
+                                bake_resolution_slider = gr.Slider(
+                                    256, 1024, label="Texture-bake view size (px)", value=1024, step=128,
+                                    info="Views are held on the GPU while baking — this is the "
+                                         "biggest VRAM term of GLB extraction.")
+                                bake_nviews_slider = gr.Slider(
+                                    20, 200, label="Texture-bake views", value=100, step=10,
+                                    info="Fewer views = less VRAM, but unseen patches may stay blank.")
                             save_metadata_checkbox = gr.Checkbox(
                                 label="Save generation metadata (.txt next to the outputs)", value=True)
 
@@ -2365,8 +3309,14 @@ def build_ui() -> gr.Blocks:
                     with gr.Column(scale=1):
                         gr.Markdown(
                             "### Presets\n"
-                            "A preset stores every slider, checkbox and batch path in this app. "
-                            "The preset you used last is restored automatically on the next start."
+                            "A preset stores every slider, checkbox and batch path in this app.\n\n"
+                            "* **🔒 Protected** — `Default` and the seven `VRAM … GB` tiers. They live in "
+                            "`configs_trellis/presets_builtin/` and are rewritten from code on every "
+                            "start, so they can never be overwritten, deleted or corrupted.\n"
+                            "* **Yours** — everything you save, in `configs_trellis/presets_user/`. "
+                            "The app never touches this folder.\n\n"
+                            "On start-up the app loads **your** last-used preset if you have one; "
+                            "otherwise it picks the VRAM tier that matches the detected GPU."
                         )
                         config_status_textbox = gr.Textbox(label="Status", interactive=False, lines=2)
                         config_load_dropdown = gr.Dropdown(label="Preset", choices=get_config_list(),
@@ -2378,15 +3328,32 @@ def build_ui() -> gr.Blocks:
                         with gr.Row(elem_classes=["tp-actions"]):
                             config_save_button = gr.Button("💾  Save preset", elem_classes=["tb-indigo"])
                             config_reset_button = gr.Button("♻️  Reset to defaults", elem_classes=["tb-amber"])
-                            config_folder_button = gr.Button("📂  Open presets folder", elem_classes=["tb-cyan"])
+                        with gr.Row(elem_classes=["tp-actions"]):
+                            user_folder_button = gr.Button("📂  Open my presets folder",
+                                                           elem_classes=["tb-cyan"])
+                            config_folder_button = gr.Button("🔒  Open protected folder",
+                                                             elem_classes=["tb-slate"])
                     with gr.Column(scale=1):
+                        gr.Markdown(
+                            "### What each VRAM tier costs\n"
+                            "Peak VRAM is measured on a real run (device occupancy sampled every "
+                            "15 ms, so the CUDA context is included), not estimated.\n\n"
+                            + "| Tier | Precision | Peak VRAM | Video | Texture |\n|---|---|---|---|---|\n"
+                            + "\n".join(
+                                f"| **{t} GB** | `{VRAM_PRESET_SPECS[t]['values']['precision_val']}` "
+                                f"| {VRAM_PRESET_SPECS[t]['peak_gb']:.1f} GB "
+                                f"| {VRAM_PRESET_SPECS[t]['values']['video_resolution_val']}px / "
+                                f"{VRAM_PRESET_SPECS[t]['values']['video_num_frames_val']}f "
+                                f"| {VRAM_PRESET_SPECS[t]['values']['texture_size_val']}px |"
+                                for t in VRAM_TIERS)
+                        )
                         gr.Markdown(
                             "### Quality cheat-sheet\n"
                             "| Goal | What to change |\n|---|---|\n"
                             "| Sharper geometry | Sparse-structure steps 20-25, guidance 7.5 |\n"
                             "| Cleaner texture | Texture size 2048, simplification 0.7-0.8 |\n"
                             "| Faster iteration | 10-12 steps, video 512 px / 120 frames, geometry pass off |\n"
-                            "| Lower VRAM | Start without `--highvram`, texture size 1024 |\n"
+                            "| Lower VRAM | fp16 precision — it is worth more than every other knob combined |\n"
                             "| Reproducible runs | Uncheck *Randomize seed* and note the seed |\n"
                         )
 
@@ -2430,13 +3397,17 @@ def build_ui() -> gr.Blocks:
             ss_guidance_strength_slider, ss_sampling_steps_slider,
             slat_guidance_strength_slider, slat_sampling_steps_slider, multiimage_algo_radio,
             mesh_simplify_slider, texture_size_slider,
+            bake_resolution_slider, bake_nviews_slider,
             video_resolution_slider, video_num_frames_slider, video_fps_slider,
             video_quality_slider, include_geometry_checkbox,
             save_metadata_checkbox,
+            precision_radio, isolate_jobs_checkbox,
             batch_input_folder_textbox, batch_output_folder_textbox, batch_skip_existing_checkbox,
             batch_gen_video_checkbox, batch_extract_glb_checkbox, batch_extract_gs_checkbox,
         ]
-        assert len(preset_ui_components) == len(PRESET_KEYS), "preset component/key mismatch"
+        assert len(preset_ui_components) == len(PRESET_KEYS), (
+            f"preset component/key mismatch: {len(preset_ui_components)} components "
+            f"vs {len(PRESET_KEYS)} keys")
 
         # Every event in this app opts out of Gradio's built-in spinner:
         #   * on the heavy events it covers the video and the 3D viewer and repaints on
@@ -2478,6 +3449,7 @@ def build_ui() -> gr.Blocks:
             video_resolution_slider, video_num_frames_slider, video_fps_slider,
             video_quality_slider, include_geometry_checkbox,
             save_metadata_checkbox, mesh_simplify_slider, texture_size_slider,
+            bake_resolution_slider, bake_nviews_slider, precision_radio, isolate_jobs_checkbox,
         ]
         gen_outputs = [output_buf, video_output, model_output, download_glb, download_gs,
                        extract_glb_btn, extract_gs_btn, gen_status, gen_log]
@@ -2507,12 +3479,14 @@ def build_ui() -> gr.Blocks:
 
         extract_glb_btn.click(
             run_extract_glb,
-            inputs=[output_buf, mesh_simplify_slider, texture_size_slider, save_metadata_checkbox],
+            inputs=[output_buf, mesh_simplify_slider, texture_size_slider, save_metadata_checkbox,
+                    bake_resolution_slider, bake_nviews_slider, precision_radio,
+                    isolate_jobs_checkbox],
             outputs=[model_output, download_glb, gen_status, gen_log],
             show_progress="hidden",
         )
         extract_gs_btn.click(
-            run_extract_gaussian, inputs=[output_buf],
+            run_extract_gaussian, inputs=[output_buf, precision_radio, isolate_jobs_checkbox],
             outputs=[model_output, download_gs, gen_status, gen_log],
             show_progress="hidden",
         )
@@ -2532,6 +3506,8 @@ def build_ui() -> gr.Blocks:
                 mesh_simplify_slider, texture_size_slider,
                 video_resolution_slider, video_num_frames_slider, video_fps_slider,
                 video_quality_slider, include_geometry_checkbox, save_metadata_checkbox,
+                bake_resolution_slider, bake_nviews_slider, precision_radio,
+                isolate_jobs_checkbox,
             ],
             outputs=[batch_status, batch_log],
             show_progress="hidden",
@@ -2558,19 +3534,36 @@ def build_ui() -> gr.Blocks:
         batch_scan_button.click(scan_batch_folder, inputs=[batch_input_folder_textbox],
                                 outputs=[batch_status, batch_log], **LIGHT)
 
+        # -- VRAM presets
+        # The radio owns the whole control panel: picking a tier writes every slider and
+        # also selects the matching protected preset in the Presets tab, so the two views
+        # never disagree about what is currently loaded.
+        vram_tier_radio.change(
+            apply_vram_preset, inputs=[vram_tier_radio],
+            outputs=[config_status_textbox, config_load_dropdown, vram_info] + preset_ui_components,
+            **LIGHT)
+
         # -- presets
+        def _load_config_and_info(name):
+            values = load_config(name)
+            return (values[0], vram_info_html(name)) + tuple(values[1:])
+
+        preset_outputs = [config_status_textbox, vram_info] + preset_ui_components
+
         config_save_button.click(save_config,
                                  inputs=[config_save_name_textbox] + preset_ui_components,
                                  outputs=[config_status_textbox, config_load_dropdown], **LIGHT)
-        config_load_button.click(load_config, inputs=[config_load_dropdown],
-                                 outputs=[config_status_textbox] + preset_ui_components, **LIGHT)
-        config_load_dropdown.change(load_config, inputs=[config_load_dropdown],
-                                    outputs=[config_status_textbox] + preset_ui_components, **LIGHT)
+        config_load_button.click(_load_config_and_info, inputs=[config_load_dropdown],
+                                 outputs=preset_outputs, **LIGHT)
+        config_load_dropdown.change(_load_config_and_info, inputs=[config_load_dropdown],
+                                    outputs=preset_outputs, **LIGHT)
         config_delete_button.click(delete_config, inputs=[config_load_dropdown],
                                    outputs=[config_status_textbox, config_load_dropdown], **LIGHT)
-        config_reset_button.click(reset_to_defaults, inputs=None,
-                                  outputs=[config_status_textbox] + preset_ui_components, **LIGHT)
+        config_reset_button.click(lambda: (reset_to_defaults()[0], vram_info_html(DEFAULT_CONFIG_NAME))
+                                  + tuple(reset_to_defaults()[1:]),
+                                  inputs=None, outputs=preset_outputs, **LIGHT)
         config_folder_button.click(lambda: open_folder(CONFIG_DIR), outputs=None, **LIGHT)
+        user_folder_button.click(lambda: open_folder(PRESET_DIR_USER), outputs=None, **LIGHT)
 
         # -- system
         load_engine_btn.click(do_load_engine, outputs=[engine_log, system_info_md],
@@ -2585,7 +3578,8 @@ def build_ui() -> gr.Blocks:
         open_app_folder_btn.click(lambda: open_folder(APP_DIR), outputs=None, **LIGHT)
 
         demo.load(initial_load_config, inputs=None,
-                  outputs=[config_load_dropdown] + preset_ui_components, **LIGHT)
+                  outputs=[config_load_dropdown, vram_tier_radio, vram_info] + preset_ui_components,
+                  **LIGHT)
 
     return demo
 
@@ -2601,11 +3595,24 @@ def _background_preload():
 
 
 def main() -> None:
+    write_builtin_presets()
+    startup_name, startup_why = startup_preset_name()
+
     banner(f"SECourses TRELLIS Studio {APP_VERSION}")
     cprint(f"  Attention backend : {ATTENTION_BACKEND} ({_ATTENTION_NOTE})", "cyan")
-    cprint(f"  Precision         : {cmd_args.precision}", "cyan")
+    if GPU_VRAM_GB:
+        tier = pick_vram_tier(GPU_VRAM_GB)
+        cprint(f"  GPU               : {GPU_NAME} ({GPU_VRAM_GB:.1f} GB) -> {tier} GB VRAM tier "
+               f"(±{VRAM_TIER_MARGIN_GB} GB margin)", "cyan")
+        cprint(f"  Expected peak     : ~{VRAM_PRESET_SPECS[tier]['peak_gb']:.1f} GB", "cyan")
+    else:
+        cprint("  GPU               : not detected via nvidia-smi", "yellow")
+    cprint(f"  Startup preset    : {startup_name} ({startup_why})", "cyan")
+    cprint(f"  Launch precision  : {cmd_args.precision} (presets can change this per run)", "cyan")
     cprint(f"  High-VRAM mode    : {'on' if cmd_args.highvram else 'off (models offload to RAM)'}", "cyan")
     cprint(f"  Outputs           : {OUTPUT_DIR_BASE}", "cyan")
+    cprint(f"  Presets           : {PRESET_DIR_BUILTIN} (protected)", "dim")
+    cprint(f"                      {PRESET_DIR_USER} (yours)", "dim")
     cprint("  Heavy libraries load on your first action, so the UI is up in a moment.", "dim")
     cprint("")
 
@@ -2632,4 +3639,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if cmd_args.worker:
+        # Child process: do one job, write the result, exit. Exiting is the point - it is
+        # what hands the CUDA context back to the driver.
+        sys.exit(worker_main(cmd_args.worker))
     main()
