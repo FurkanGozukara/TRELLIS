@@ -362,20 +362,38 @@ def pick_vram_tier(total_gb: Optional[float]) -> int:
     return eligible[-1] if eligible else VRAM_TIERS[0]
 
 
-# `peak_gb` is measured, not estimated: each preset was run end to end (generate +
-# GLB + Gaussian) while sampling `torch.cuda.mem_get_info()` every 15 ms, so it is the
-# true device occupancy - allocator, CUDA context and driver overhead included - and
-# not torch's `max_memory_allocated`, which ignores the ~1.2-1.7 GB CUDA context.
-# Measured on an RTX 5090; the CUDA context is ~0.4 GB smaller on cards with fewer SMs,
-# so smaller GPUs sit a little under these numbers.
+# `peak_gb` is measured, not estimated. Every preset below was run end to end through the
+# app's own isolated worker (generate -> GLB -> Gaussian) while a background thread sampled
+# `torch.cuda.mem_get_info()` every 50 ms, so these are true device occupancy - allocator
+# blocks, CUDA context and driver overhead included. torch's own `max_memory_allocated`
+# reports roughly half of this because it only counts live tensors; do not trust it here.
+#
+# The shape of the numbers is worth knowing before touching any of these values:
+#   * The peak is almost always the SLat mesh decoder. It expands ~17k voxels to a 256³
+#     flexicubes grid and costs ~7.6 GB in fp16 / ~12.0 GB in fp32 - and it does not care
+#     about video resolution, texture size, step counts or process isolation.
+#   * Which is why `generate_mesh_val` exists. Turning the mesh off is the only thing that
+#     moves that number, and it is what makes the 6 GB tier real rather than aspirational.
+#   * Everything else is comparatively cheap: video rendering peaks ~3.7-5.5 GB, GLB
+#     texture baking ~3.8-9.0 GB depending on bake_resolution x bake_nviews.
+#
+# `peak_gb` is a typical subject and `peak_max_gb` is the worst case measured, because the
+# mesh decoder scales with how much of the volume the subject occupies: the reference
+# dragon activates ~17k voxels and peaks at 7.65 GB in fp16, a detailed cottage activates
+# ~20k and peaks at 8.08 GB. Quote the range, never just the low end.
+#
+# Measured on an RTX 5090 (170 SMs, 1.69 GB CUDA context). Cards with fewer SMs carry a
+# smaller context - an RTX 3090 measured 1.25 GB - so a small GPU lands 0.4-0.8 GB below
+# these figures. They are therefore a safe upper bound, not an optimistic one.
 VRAM_PRESET_SPECS: Dict[int, Dict[str, Any]] = {
     6: {
-        "peak_gb": 4.4,
-        "peak_glb_gb": 7.0,
-        "note": "Gaussian splat + video fit comfortably. GLB/mesh extraction needs ~7 GB "
-                "on any settings — see the warning below.",
+        "peak_gb": 5.1,
+        "peak_max_gb": 5.5,
+        "mesh_peak_gb": 7.6,
+        "note": "Gaussian splat + turntable video only. The mesh decoder needs ~7.6 GB "
+                "even in fp16, which no 6 GB card can give it, so this tier skips it.",
         "values": {
-            "precision_val": "fp16", "isolate_jobs_val": True,
+            "precision_val": "fp16", "isolate_jobs_val": True, "generate_mesh_val": False,
             "ss_sampling_steps_val": 12, "slat_sampling_steps_val": 12,
             "video_resolution_val": 512, "video_num_frames_val": 120, "video_fps_val": 30,
             "video_quality_val": 7, "include_geometry_val": False,
@@ -384,10 +402,12 @@ VRAM_PRESET_SPECS: Dict[int, Dict[str, Any]] = {
         },
     },
     8: {
-        "peak_gb": 7.0,
-        "note": "Everything works, with little room to spare — close other GPU apps.",
+        "peak_gb": 7.6,
+        "peak_max_gb": 8.1,
+        "note": "Everything works, but the mesh decode fills the card — close other GPU "
+                "apps first. Drop to the 6 GB tier if you hit an out-of-memory error.",
         "values": {
-            "precision_val": "fp16", "isolate_jobs_val": True,
+            "precision_val": "fp16", "isolate_jobs_val": True, "generate_mesh_val": True,
             "ss_sampling_steps_val": 12, "slat_sampling_steps_val": 12,
             "video_resolution_val": 512, "video_num_frames_val": 150, "video_fps_val": 30,
             "video_quality_val": 8, "include_geometry_val": False,
@@ -396,10 +416,11 @@ VRAM_PRESET_SPECS: Dict[int, Dict[str, Any]] = {
         },
     },
     10: {
-        "peak_gb": 7.5,
+        "peak_gb": 7.6,
+        "peak_max_gb": 8.1,
         "note": "Full feature set including the geometry pass in the preview video.",
         "values": {
-            "precision_val": "fp16", "isolate_jobs_val": True,
+            "precision_val": "fp16", "isolate_jobs_val": True, "generate_mesh_val": True,
             "ss_sampling_steps_val": 14, "slat_sampling_steps_val": 14,
             "video_resolution_val": 768, "video_num_frames_val": 180, "video_fps_val": 30,
             "video_quality_val": 8, "include_geometry_val": True,
@@ -408,11 +429,12 @@ VRAM_PRESET_SPECS: Dict[int, Dict[str, Any]] = {
         },
     },
     12: {
-        "peak_gb": 7.7,
-        "note": "Half precision keeps the mesh decoder inside 12 GB; full precision would "
-                "need ~12.1 GB and leave nothing for the desktop.",
+        "peak_gb": 7.6,
+        "peak_max_gb": 8.1,
+        "note": "Half precision keeps the mesh decoder at ~7.6 GB; fp32 would want ~12.1 GB "
+                "and leave nothing for the desktop on a 12 GB card.",
         "values": {
-            "precision_val": "fp16", "isolate_jobs_val": False,
+            "precision_val": "fp16", "isolate_jobs_val": False, "generate_mesh_val": True,
             "ss_sampling_steps_val": 16, "slat_sampling_steps_val": 16,
             "video_resolution_val": 1024, "video_num_frames_val": 240, "video_fps_val": 60,
             "video_quality_val": 8, "include_geometry_val": True,
@@ -421,10 +443,11 @@ VRAM_PRESET_SPECS: Dict[int, Dict[str, Any]] = {
         },
     },
     16: {
-        "peak_gb": 12.2,
+        "peak_gb": 12.1,
+        "peak_max_gb": 12.9,
         "note": "Full fp32 precision — the reference quality setting.",
         "values": {
-            "precision_val": "fp32", "isolate_jobs_val": False,
+            "precision_val": "fp32", "isolate_jobs_val": False, "generate_mesh_val": True,
             "ss_sampling_steps_val": 18, "slat_sampling_steps_val": 18,
             "video_resolution_val": 1024, "video_num_frames_val": 240, "video_fps_val": 60,
             "video_quality_val": 9, "include_geometry_val": True,
@@ -433,10 +456,11 @@ VRAM_PRESET_SPECS: Dict[int, Dict[str, Any]] = {
         },
     },
     24: {
-        "peak_gb": 12.4,
+        "peak_gb": 12.1,
+        "peak_max_gb": 12.9,
         "note": "fp32 with a 2K baked texture and a denser mesh.",
         "values": {
-            "precision_val": "fp32", "isolate_jobs_val": False,
+            "precision_val": "fp32", "isolate_jobs_val": False, "generate_mesh_val": True,
             "ss_sampling_steps_val": 20, "slat_sampling_steps_val": 20,
             "video_resolution_val": 1024, "video_num_frames_val": 300, "video_fps_val": 60,
             "video_quality_val": 9, "include_geometry_val": True,
@@ -445,10 +469,11 @@ VRAM_PRESET_SPECS: Dict[int, Dict[str, Any]] = {
         },
     },
     32: {
-        "peak_gb": 12.8,
+        "peak_gb": 12.1,
+        "peak_max_gb": 12.9,
         "note": "Maximum quality — nothing is traded away for memory.",
         "values": {
-            "precision_val": "fp32", "isolate_jobs_val": False,
+            "precision_val": "fp32", "isolate_jobs_val": False, "generate_mesh_val": True,
             "ss_sampling_steps_val": 25, "slat_sampling_steps_val": 25,
             "video_resolution_val": 1536, "video_num_frames_val": 360, "video_fps_val": 60,
             "video_quality_val": 10, "include_geometry_val": True,
@@ -1078,7 +1103,9 @@ def install_tqdm_hook() -> None:
 # Generation core
 # --------------------------------------------------------------------------------------
 def pack_state(gs, mesh) -> dict:
-    return {
+    """`mesh` is None in Gaussian-only mode, which is what lets a 6 GB card finish a run -
+    decoding the mesh alone needs ~7.6 GB and no setting brings that down."""
+    state = {
         "gaussian": {
             **gs.init_params,
             "_xyz": gs._xyz.cpu().numpy(),
@@ -1087,11 +1114,17 @@ def pack_state(gs, mesh) -> dict:
             "_rotation": gs._rotation.cpu().numpy(),
             "_opacity": gs._opacity.cpu().numpy(),
         },
-        "mesh": {
+    }
+    if mesh is not None:
+        state["mesh"] = {
             "vertices": mesh.vertices.cpu().numpy(),
             "faces": mesh.faces.cpu().numpy(),
-        },
-    }
+        }
+    return state
+
+
+def state_has_mesh(state: Optional[dict]) -> bool:
+    return bool(state) and bool(state.get("mesh"))
 
 
 def unpack_state(state: dict):
@@ -1110,10 +1143,12 @@ def unpack_state(state: dict):
     gs._rotation = torch.tensor(state["gaussian"]["_rotation"], device="cuda")
     gs._opacity = torch.tensor(state["gaussian"]["_opacity"], device="cuda")
 
-    mesh = ENGINE.edict(
-        vertices=torch.tensor(state["mesh"]["vertices"], device="cuda"),
-        faces=torch.tensor(state["mesh"]["faces"], device="cuda"),
-    )
+    mesh = None
+    if state_has_mesh(state):
+        mesh = ENGINE.edict(
+            vertices=torch.tensor(state["mesh"]["vertices"], device="cuda"),
+            faces=torch.tensor(state["mesh"]["faces"], device="cuda"),
+        )
     return gs, mesh
 
 
@@ -1196,10 +1231,18 @@ def generate_one(
     include_geometry: bool,
     save_metadata: bool,
     make_video: bool = True,
+    generate_mesh: bool = True,
     output_filename_prefix: Optional[str] = None,
     custom_output_dirs: Optional[dict] = None,
 ) -> Tuple[dict, Optional[str]]:
-    """One image -> 3D run. Returns (state, video_path or None)."""
+    """One image -> 3D run. Returns (state, video_path or None).
+
+    With `generate_mesh=False` the structured latent is only decoded into a Gaussian
+    splat. That skips the mesh decoder, which is the single biggest allocation in the
+    whole pipeline (~7.6 GB in fp16, ~12.0 GB in fp32, and unaffected by every other
+    setting) - so it is what makes a 6 GB card able to finish a run at all. The cost is
+    that there is no mesh, hence no GLB and no geometry pass in the preview video.
+    """
     torch = ENGINE.torch
     render_utils = ENGINE.render_utils
     pipeline = ENGINE.pipeline
@@ -1226,18 +1269,22 @@ def generate_one(
     sampler_ss = {"steps": int(ss_sampling_steps), "cfg_strength": float(ss_guidance_strength)}
     sampler_slat = {"steps": int(slat_sampling_steps), "cfg_strength": float(slat_guidance_strength)}
 
+    formats = ["gaussian", "mesh"] if generate_mesh else ["gaussian"]
+    include_geometry = bool(include_geometry) and generate_mesh
+
     job.stage(f"Sparse structure + latent sampling (seed {seed})", bars=2)
     job.set_detail(f"SS {ss_sampling_steps} steps @ cfg {ss_guidance_strength} · "
-                   f"SLat {slat_sampling_steps} steps @ cfg {slat_guidance_strength}")
+                   f"SLat {slat_sampling_steps} steps @ cfg {slat_guidance_strength}"
+                   + ("" if generate_mesh else " · Gaussian only (low-VRAM mode)"))
     if is_multiimage:
         outputs = pipeline.run_multi_image(
-            images, seed=int(seed), formats=["gaussian", "mesh"], preprocess_image=False,
+            images, seed=int(seed), formats=formats, preprocess_image=False,
             sparse_structure_sampler_params=sampler_ss, slat_sampler_params=sampler_slat,
             mode=multiimage_algo, cancel_event=job.cancel_event,
         )
     else:
         outputs = pipeline.run(
-            image, seed=int(seed), formats=["gaussian", "mesh"], preprocess_image=False,
+            image, seed=int(seed), formats=formats, preprocess_image=False,
             sparse_structure_sampler_params=sampler_ss, slat_sampler_params=sampler_slat,
             cancel_event=job.cancel_event,
         )
@@ -1245,9 +1292,13 @@ def generate_one(
     job.raise_if_cancelled()
 
     gaussian = outputs["gaussian"][0]
-    mesh = outputs["mesh"][0]
-    job.log(f"  Mesh: {mesh.vertices.shape[0]:,} vertices / {mesh.faces.shape[0]:,} triangles | "
-            f"Gaussians: {gaussian._xyz.shape[0]:,}")
+    mesh = outputs["mesh"][0] if generate_mesh else None
+    if mesh is not None:
+        job.log(f"  Mesh: {mesh.vertices.shape[0]:,} vertices / {mesh.faces.shape[0]:,} triangles | "
+                f"Gaussians: {gaussian._xyz.shape[0]:,}")
+    else:
+        job.log(f"  Gaussians: {gaussian._xyz.shape[0]:,} (mesh decoding skipped to save VRAM - "
+                f"GLB extraction is not available for this run)", level="warn")
 
     if make_video:
         job.stage(f"Rendering the preview video ({video_num_frames} frames @ {video_resolution}px)",
@@ -1315,8 +1366,9 @@ def generate_one(
             "video_includes_geometry_pass": bool(include_geometry) if make_video else False,
             "attention_backend": ATTENTION_BACKEND,
             "precision": ENGINE.precision,
-            "mesh_vertices": int(mesh.vertices.shape[0]),
-            "mesh_triangles": int(mesh.faces.shape[0]),
+            "mesh_generated": mesh is not None,
+            "mesh_vertices": int(mesh.vertices.shape[0]) if mesh is not None else None,
+            "mesh_triangles": int(mesh.faces.shape[0]) if mesh is not None else None,
             "num_gaussians": int(gaussian._xyz.shape[0]),
             "generation_duration_seconds": round(generation_duration, 2),
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time)),
@@ -1337,6 +1389,11 @@ def extract_glb_file(job: JobState, state: dict, mesh_simplify: float, texture_s
                      save_metadata: bool, bake_resolution: int = 1024,
                      bake_nviews: int = 100) -> str:
     torch = ENGINE.torch
+    if not state_has_mesh(state):
+        raise RuntimeError(
+            "This run was generated in Gaussian-only mode, so there is no mesh to turn into "
+            "a GLB. Tick 'Also decode a mesh' (needs about 7.6 GB of VRAM in fp16) and "
+            "generate again — or use the Gaussian .ply, which is already available.")
     gs, mesh = unpack_state(state)
     vertex_count = int(mesh.vertices.shape[0])
     face_count = int(mesh.faces.shape[0])
@@ -1425,7 +1482,7 @@ PRESET_KEYS = [
     "video_resolution_val", "video_num_frames_val", "video_fps_val",
     "video_quality_val", "include_geometry_val",
     "save_metadata_val",
-    "precision_val", "isolate_jobs_val",
+    "precision_val", "isolate_jobs_val", "generate_mesh_val",
     "batch_input_folder_val", "batch_output_folder_val", "batch_skip_existing_val",
     "batch_gen_video_cb_val", "batch_extract_glb_cb_val", "batch_extract_gaussian_cb_val",
 ]
@@ -1453,6 +1510,7 @@ def get_default_config_values() -> Dict[str, Any]:
         "save_metadata_val": True,
         "precision_val": cmd_args.precision,
         "isolate_jobs_val": False,
+        "generate_mesh_val": True,
         "batch_input_folder_val": DEFAULT_BATCH_INPUT,
         "batch_output_folder_val": BATCH_OUTPUT_DIR_BASE_DEFAULT,
         "batch_skip_existing_val": True,
@@ -1671,23 +1729,32 @@ def vram_info_html(preset_name: Optional[str]) -> str:
     if tier is None:
         values = read_preset(preset_name or "") or get_default_config_values()
         prec = values.get("precision_val", cmd_args.precision)
-        # fp32 keeps the flexicubes grid in the mesh decoder at full width, which is the
-        # single biggest allocation in the whole app.
-        est = 12.2 if prec == "fp32" else 7.7
+        if not values.get("generate_mesh_val", True):
+            lo, hi, what = 5.1, 5.5, "Gaussian only"
+        else:
+            # fp32 keeps the flexicubes grid in the mesh decoder at full width, which is
+            # the single biggest allocation in the whole app.
+            lo, hi, what = (12.1, 12.9, "with mesh") if prec == "fp32" else (7.6, 8.1, "with mesh")
         body = (f"<b>{esc(str(preset_name or 'Custom'))}</b> — not a VRAM tier. "
-                f"At <code>{esc(str(prec))}</code> precision expect a peak around "
-                f"<b>{est:.1f} GB</b>.")
+                f"At <code>{esc(str(prec))}</code> precision, {what}, expect a peak of "
+                f"<b>{lo:.1f} – {hi:.1f} GB</b> depending on how busy the subject is.")
         return (f'<div class="tp-vram"><div class="tp-vram-gpu">{gpu_line}</div>'
                 f'<div class="tp-vram-body">{body}</div></div>')
 
     spec = VRAM_PRESET_SPECS[tier]
     values = spec["values"]
     peak = spec["peak_gb"]
-    fits = (GPU_VRAM_GB is None) or (peak <= GPU_VRAM_GB + VRAM_TIER_MARGIN_GB)
+    peak_max = spec.get("peak_max_gb", peak)
+    # The tier's own budget is the honest bar, judged on the worst case rather than the
+    # typical one: a 6 GB preset has to fit 6 GB even when previewed on a 32 GB card, and
+    # even when the subject is a busy one.
+    fits = peak_max <= tier + VRAM_TIER_MARGIN_GB
     klass = "tp-vram-ok" if fits else "tp-vram-warn"
 
     rows = (f"precision <code>{esc(values['precision_val'])}</code> &middot; "
-            f"video {values['video_resolution_val']}px / {values['video_num_frames_val']} frames"
+            f"{'mesh + Gaussian' if values.get('generate_mesh_val', True) else '<b>Gaussian only</b>'}"
+            f" &middot; video {values['video_resolution_val']}px / "
+            f"{values['video_num_frames_val']} frames"
             f"{' + geometry pass' if values['include_geometry_val'] else ''} &middot; "
             f"texture {values['texture_size_val']}px &middot; "
             f"bake {values['bake_resolution_val']}px × {values['bake_nviews_val']} views &middot; "
@@ -1695,19 +1762,21 @@ def vram_info_html(preset_name: Optional[str]) -> str:
             f"{' &middot; isolated subprocess' if values.get('isolate_jobs_val') else ''}")
 
     extra = ""
-    if spec.get("peak_glb_gb"):
-        extra = (f'<div class="tp-vram-warnline">⚠ GLB / mesh extraction peaks at about '
-                 f'<b>{spec["peak_glb_gb"]:.1f} GB</b> no matter how the sliders are set — '
-                 f'the mesh decoder builds a 256³ grid. On a {tier} GB card, stick to the '
-                 f'Gaussian splat and the preview video.</div>')
+    if spec.get("mesh_peak_gb"):
+        extra = (f'<div class="tp-vram-warnline">No GLB on this tier. Decoding a mesh peaks at '
+                 f'<b>{spec["mesh_peak_gb"]:.1f} GB</b> regardless of every other setting — '
+                 f'the decoder expands the latent into a 256³ grid — so this preset asks for '
+                 f'the Gaussian splat only. You still get a <code>.ply</code> and the turntable '
+                 f'video; tick “Also decode a mesh” if you want to try the GLB anyway.</div>')
     elif not fits:
-        extra = ('<div class="tp-vram-warnline">⚠ This preset needs more VRAM than the '
-                 'detected card has. Pick a lower tier.</div>')
+        extra = (f'<div class="tp-vram-warnline">⚠ This preset peaks above its own {tier} GB '
+                 f'budget. Pick a lower tier.</div>')
 
     return f"""
 <div class="tp-vram {klass}">
   <div class="tp-vram-gpu">{gpu_line}</div>
-  <div class="tp-vram-peak">Peak VRAM <b>≈ {peak:.1f} GB</b> <span>of {tier} GB</span></div>
+  <div class="tp-vram-peak">Peak VRAM <b>{peak:.1f} – {peak_max:.1f} GB</b>
+    <span>of {tier} GB &middot; typical → busiest subject</span></div>
   <div class="tp-vram-body">{rows}</div>
   <div class="tp-vram-note">{esc(spec['note'])}</div>
   {extra}
@@ -1826,6 +1895,8 @@ def state_to_disk(state: dict, path: str) -> str:
     if state.get("custom_output_dirs"):
         meta["custom_output_dirs"] = state["custom_output_dirs"]
     for group in ("gaussian", "mesh"):
+        if not state.get(group):                                   # Gaussian-only runs have no mesh
+            continue
         for key, value in state[group].items():
             if isinstance(value, np.ndarray):
                 flat[f"{group}.{key}"] = value
@@ -1838,16 +1909,16 @@ def state_to_disk(state: dict, path: str) -> str:
 def state_from_disk(path: str) -> dict:
     with np.load(path, allow_pickle=False) as data:
         meta = json.loads(bytes(data["__meta__"]).decode("utf-8"))
-        state: Dict[str, Any] = {"gaussian": {}, "mesh": {}}
+        state: Dict[str, Any] = {"gaussian": {}}
         for key in data.files:
             if key == "__meta__":
                 continue
             group, _, field = key.partition(".")
-            state[group][field] = data[key]
+            state.setdefault(group, {})[field] = data[key]
     for key, value in meta.items():
         group, _, field = key.partition(".")
         if group in ("gaussian", "mesh") and field:
-            state[group][field] = value
+            state.setdefault(group, {})[field] = value
         else:
             state[key] = value
     return state
@@ -2001,7 +2072,8 @@ def worker_main(job_path: str) -> int:
             state_path = payload["state_path"]
             state_to_disk(state, state_path)
             out = {"state_path": state_path, "video": video_path,
-                   "filename_base": state.get("filename_base")}
+                   "filename_base": state.get("filename_base"),
+                   "has_mesh": state_has_mesh(state)}
         elif kind == "extract_glb":
             state = state_from_disk(payload["state_path"])
             out = {"glb": extract_glb_file(job, state, **payload["kwargs"])}
@@ -2039,6 +2111,27 @@ GEN_POLL = 0.4
 
 def _skips(n: int):
     return tuple(gr.skip() for _ in range(n))
+
+
+def explain_failure(error) -> str:
+    """Turn a raw failure into something the user can act on.
+
+    An out-of-memory here is almost always the mesh decoder, and the fix is a specific
+    setting rather than 'try again' - so say which one instead of echoing a CUDA dump.
+    """
+    text = f"{type(error).__name__}: {error}" if isinstance(error, BaseException) else str(error)
+    lowered = text.lower()
+    if "out of memory" in lowered or ("cuda error" in lowered and "memory" in lowered):
+        tier = pick_vram_tier(GPU_VRAM_GB)
+        hint = ("Ran out of VRAM. The mesh decoder is what needs the most (~7.6 GB in fp16, "
+                "~12.1 GB in fp32) and no other setting reduces it. Try, in order: "
+                "set precision to fp16; tick 'Run each job in its own process'; "
+                "untick 'Also decode a mesh' to get the Gaussian splat and video only "
+                "(under 5 GB); close other GPU applications.")
+        if tier <= 8:
+            hint += f" Your card is on the {tier} GB tier, where this is expected to be tight."
+        return f"{hint}\n\nOriginal error: {text}"
+    return text
 
 
 def _stream_status(job: "JobState", thread: threading.Thread, emit, poll: float = GEN_POLL):
@@ -2160,6 +2253,30 @@ def _new_job_tmp(suffix: str) -> str:
     return os.path.join(JOB_TMP_DIR, f"{int(time.time() * 1000)}_{os.getpid()}_{suffix}")
 
 
+def sweep_job_tmp(max_age_hours: float = 24.0) -> None:
+    """Drop handoff files left behind by a crash or a kill.
+
+    A Gaussian state is ~40 MB, so without this the folder grows without bound. Anything
+    still needed by the current session is younger than this cutoff by a wide margin.
+    """
+    cutoff = time.time() - max_age_hours * 3600
+    removed = 0
+    try:
+        entries = os.listdir(JOB_TMP_DIR)
+    except OSError:
+        return
+    for name in entries:
+        path = os.path.join(JOB_TMP_DIR, name)
+        try:
+            if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                os.remove(path)
+                removed += 1
+        except OSError:
+            pass
+    if removed:
+        cprint(f"[{stamp()}] Cleaned {removed} stale job file(s) from {JOB_TMP_DIR}.", "dim")
+
+
 def _stash_images_for_worker(image, multiimages, is_multiimage) -> Dict[str, Any]:
     """A child process cannot be handed PIL objects, so put the pixels on disk."""
     from PIL import Image as PILImage                              # cheap, pillow is already up
@@ -2227,6 +2344,9 @@ def do_generate(job: JobState, *, isolate: bool, precision: str, image, multiima
                                          is_multiimage=is_multiimage, **kwargs)
         return state, video_path
 
+    # Everything below travels to a child process as JSON, so only plain data may be in
+    # kwargs by this point - the images have already been written to disk.
+
     state_path = _new_job_tmp("state.npz")
     payload = {
         "precision": precision,
@@ -2235,8 +2355,18 @@ def do_generate(job: JobState, *, isolate: bool, precision: str, image, multiima
                    "is_multiimage": bool(is_multiimage)},
     }
     result = run_isolated(job, "generate", payload)
-    ref = {"__state_path__": result["state_path"], "filename_base": result.get("filename_base")}
+    ref = {"__state_path__": result["state_path"], "filename_base": result.get("filename_base"),
+           "has_mesh": bool(result.get("has_mesh"))}
     return ref, result.get("video")
+
+
+def result_has_mesh(value) -> bool:
+    """Whether a generation result can produce a GLB (works for both state shapes)."""
+    if not value:
+        return False
+    if isinstance(value, dict) and "__state_path__" in value:
+        return bool(value.get("has_mesh"))
+    return state_has_mesh(value)
 
 
 def do_extract_glb(job: JobState, state_value, *, isolate: bool, precision: str,
@@ -2268,7 +2398,7 @@ def run_generation(
     ss_guidance, ss_steps, slat_guidance, slat_steps, multiimage_algo,
     video_resolution, video_frames, video_fps, video_quality, include_geometry,
     save_metadata, mesh_simplify, texture_size,
-    bake_resolution, bake_nviews, precision, isolate_jobs,
+    bake_resolution, bake_nviews, precision, isolate_jobs, generate_mesh,
 ):
     """Streaming handler used by both generate buttons."""
     n_out = 9   # state, video, model, dl_glb, dl_gs, btn_glb, btn_gs, status, log
@@ -2290,13 +2420,21 @@ def run_generation(
         return
 
     isolate = bool(isolate_jobs)
+    generate_mesh = bool(generate_mesh)
     precision = precision if precision in ("fp16", "fp32") else cmd_args.precision
-    per_gen_stages = 4 + (2 if do_extract else 0)
+    # "Extract everything" means everything that exists: without a mesh there is no GLB to
+    # build, so extract the Gaussian splat and say so rather than failing a minute later.
+    want_glb = do_extract and generate_mesh
+    extract_steps = (1 if want_glb else 0) + (1 if do_extract else 0)
+    per_gen_stages = 4 + extract_steps
     job = JobState("Generation")
     # In isolated mode each operation spawns its own process, and each of those reports a
     # "Preparing the engine" stage of its own, so the plan has to make room for them.
-    engine_stages = (1 + (2 if do_extract else 0)) * num_gens if isolate else 1
+    engine_stages = (1 + extract_steps) * num_gens if isolate else 1
     job.set_plan(engine_stages + per_gen_stages * num_gens)
+    if do_extract and not generate_mesh:
+        job.log("Gaussian-only mode: skipping GLB extraction (there is no mesh to build it "
+                "from). The .ply and the preview video are still produced.", level="warn")
     job.set_headline(f"{num_gens} generation(s)" + (" + extraction" if do_extract else ""))
     register_job("generate", job)
 
@@ -2349,19 +2487,25 @@ def run_generation(
                     video_fps=video_fps, video_quality=video_quality,
                     include_geometry=bool(include_geometry),
                     save_metadata=bool(save_metadata),
+                    generate_mesh=bool(generate_mesh),
                     output_filename_prefix=prefix,
                 )
+                # Only the newest run stays reachable from the UI, so an isolated run's
+                # handoff file for the previous iteration is already garbage.
+                if results["state"] is not None and results["state"] is not state:
+                    _discard_state_file(results["state"])
                 results["state"] = state
                 results["video"] = video_path
                 results["count"] = i + 1
 
-                if do_extract:
+                if want_glb:
                     job.raise_if_cancelled()
                     results["glb"] = do_extract_glb(
                         job, state, isolate=isolate, precision=precision,
                         mesh_simplify=mesh_simplify, texture_size=texture_size,
                         save_metadata=save_metadata, bake_resolution=bake_resolution,
                         bake_nviews=bake_nviews)
+                if do_extract:
                     job.raise_if_cancelled()
                     results["gs"] = do_extract_gaussian(job, state, isolate=isolate,
                                                         precision=precision)
@@ -2387,9 +2531,9 @@ def run_generation(
     error = box.get("error")
     if error is not None and not job.cancelled and not isinstance(error, JobCancelled):
         job.status = "error"
-        job.log(f"FAILED: {type(error).__name__}: {error}", level="err")
+        job.log(f"FAILED: {explain_failure(error)}", level="err")
         cprint(box.get("traceback", ""), "red")
-        gr.Warning(f"Generation failed: {error}")
+        gr.Warning(f"Generation failed: {explain_failure(error)}")
     elif error is not None or job.cancelled:
         job.status = "cancelled"
         job.log("Task cancelled.", level="warn")
@@ -2408,7 +2552,9 @@ def run_generation(
         model_path,
         gr.update(value=results["glb"], interactive=bool(results["glb"])),
         gr.update(value=results["gs"], interactive=bool(results["gs"])),
-        gr.update(interactive=bool(state)),
+        # No mesh means no GLB, so leave that button disabled rather than letting the
+        # click fail a minute later.
+        gr.update(interactive=result_has_mesh(state)),
         gr.update(interactive=bool(state)),
         html,
         log_text,
@@ -2447,9 +2593,9 @@ def run_extract_glb(state, mesh_simplify, texture_size, save_metadata,
     error = box.get("error")
     if error is not None and not job.cancelled and not isinstance(error, JobCancelled):
         job.status = "error"
-        job.log(f"FAILED: {error}", level="err")
+        job.log(f"FAILED: {explain_failure(error)}", level="err")
         cprint(box.get("traceback", ""), "red")
-        gr.Warning(f"GLB extraction failed: {error}")
+        gr.Warning(f"GLB extraction failed: {explain_failure(error)}")
     elif error is not None or job.cancelled:
         job.status = "cancelled"
     else:
@@ -2489,9 +2635,9 @@ def run_extract_gaussian(state, precision, isolate_jobs):
     error = box.get("error")
     if error is not None and not job.cancelled:
         job.status = "error"
-        job.log(f"FAILED: {error}", level="err")
+        job.log(f"FAILED: {explain_failure(error)}", level="err")
         cprint(box.get("traceback", ""), "red")
-        gr.Warning(f"Gaussian extraction failed: {error}")
+        gr.Warning(f"Gaussian extraction failed: {explain_failure(error)}")
     elif error is not None:
         job.status = "cancelled"
     else:
@@ -2523,6 +2669,7 @@ def run_batch_processing(
     seed, randomize_seed, ss_guidance, ss_steps, slat_guidance, slat_steps, multiimage_algo,
     mesh_simplify, texture_size, video_resolution, video_frames, video_fps, video_quality,
     include_geometry, save_metadata, bake_resolution, bake_nviews, precision, isolate_jobs,
+    generate_mesh,
 ):
     batch_input_dir = (batch_input_dir or "").strip()
     if not batch_input_dir or not os.path.isdir(batch_input_dir):
@@ -2553,7 +2700,12 @@ def run_batch_processing(
         os.makedirs(path, exist_ok=True)
 
     isolate = bool(isolate_jobs)
+    generate_mesh = bool(generate_mesh)
     precision = precision if precision in ("fp16", "fp32") else cmd_args.precision
+    if extract_glb_cb and not generate_mesh:
+        gr.Warning("Gaussian-only mode is on, so no GLB can be produced - unticking 'GLB mesh' "
+                   "for this batch.")
+        extract_glb_cb = False
     total_iterations = len(all_files) * num_gens_per_image
     # prepare image, sample, render video, write video (+ optional extractions)
     per_item_stages = 4 + (1 if extract_glb_cb else 0) + (1 if extract_gs_cb else 0)
@@ -2629,6 +2781,7 @@ def run_batch_processing(
                             include_geometry=bool(include_geometry),
                             save_metadata=bool(save_metadata),
                             make_video=bool(gen_video_cb),
+                            generate_mesh=bool(generate_mesh),
                             output_filename_prefix=output_prefix,
                             custom_output_dirs=custom_dirs,
                         )
@@ -2668,7 +2821,7 @@ def run_batch_processing(
                         if job.cancelled:
                             raise JobCancelled(str(exc)) from exc
                         stats["failed"] += 1
-                        job.log(f"ERROR on {output_prefix}: {exc}", level="err")
+                        job.log(f"ERROR on {output_prefix}: {explain_failure(exc)}", level="err")
                         traceback.print_exc()
                         job.stage_idx = min(job.stage_count, 1 + (done_so_far + 1) * per_item_stages)
         finally:
@@ -2683,7 +2836,7 @@ def run_batch_processing(
     summary = box.get("result") or stats
     if error is not None and not job.cancelled and not isinstance(error, JobCancelled):
         job.status = "error"
-        job.log(f"Batch failed: {error}", level="err")
+        job.log(f"Batch failed: {explain_failure(error)}", level="err")
         cprint(box.get("traceback", ""), "red")
     elif error is not None or job.cancelled:
         job.status = "cancelled"
@@ -3174,6 +3327,11 @@ def build_ui() -> gr.Blocks:
                                     label="Run each job in its own process", value=False,
                                     info="Frees the CUDA context (1.2–1.7 GB) between runs instead of "
                                          "just the tensor cache. Costs one model load per job.")
+                            generate_mesh_checkbox = gr.Checkbox(
+                                label="Also decode a mesh (required for GLB)", value=True,
+                                info="The mesh decoder alone peaks at ~7.6 GB in fp16 / ~12.1 GB in "
+                                     "fp32 and ignores every other setting. Untick it and you get "
+                                     "the Gaussian .ply plus the video for under 5 GB — but no GLB.")
 
                         with gr.Accordion("Generation settings", open=True):
                             with gr.Row():
@@ -3338,14 +3496,19 @@ def build_ui() -> gr.Blocks:
                             "### What each VRAM tier costs\n"
                             "Peak VRAM is measured on a real run (device occupancy sampled every "
                             "15 ms, so the CUDA context is included), not estimated.\n\n"
-                            + "| Tier | Precision | Peak VRAM | Video | Texture |\n|---|---|---|---|---|\n"
+                            + "| Tier | Precision | Mesh | Peak VRAM | Video | Texture |\n"
+                              "|---|---|---|---|---|---|\n"
                             + "\n".join(
                                 f"| **{t} GB** | `{VRAM_PRESET_SPECS[t]['values']['precision_val']}` "
-                                f"| {VRAM_PRESET_SPECS[t]['peak_gb']:.1f} GB "
+                                f"| {'yes' if VRAM_PRESET_SPECS[t]['values']['generate_mesh_val'] else '—'} "
+                                f"| {VRAM_PRESET_SPECS[t]['peak_gb']:.1f}–"
+                                f"{VRAM_PRESET_SPECS[t].get('peak_max_gb', VRAM_PRESET_SPECS[t]['peak_gb']):.1f} GB "
                                 f"| {VRAM_PRESET_SPECS[t]['values']['video_resolution_val']}px / "
                                 f"{VRAM_PRESET_SPECS[t]['values']['video_num_frames_val']}f "
                                 f"| {VRAM_PRESET_SPECS[t]['values']['texture_size_val']}px |"
                                 for t in VRAM_TIERS)
+                            + "\n\nThe range is typical subject → busiest subject: the mesh decoder's "
+                              "cost scales with how much of the volume the object fills."
                         )
                         gr.Markdown(
                             "### Quality cheat-sheet\n"
@@ -3401,7 +3564,7 @@ def build_ui() -> gr.Blocks:
             video_resolution_slider, video_num_frames_slider, video_fps_slider,
             video_quality_slider, include_geometry_checkbox,
             save_metadata_checkbox,
-            precision_radio, isolate_jobs_checkbox,
+            precision_radio, isolate_jobs_checkbox, generate_mesh_checkbox,
             batch_input_folder_textbox, batch_output_folder_textbox, batch_skip_existing_checkbox,
             batch_gen_video_checkbox, batch_extract_glb_checkbox, batch_extract_gs_checkbox,
         ]
@@ -3450,6 +3613,7 @@ def build_ui() -> gr.Blocks:
             video_quality_slider, include_geometry_checkbox,
             save_metadata_checkbox, mesh_simplify_slider, texture_size_slider,
             bake_resolution_slider, bake_nviews_slider, precision_radio, isolate_jobs_checkbox,
+            generate_mesh_checkbox,
         ]
         gen_outputs = [output_buf, video_output, model_output, download_glb, download_gs,
                        extract_glb_btn, extract_gs_btn, gen_status, gen_log]
@@ -3507,7 +3671,7 @@ def build_ui() -> gr.Blocks:
                 video_resolution_slider, video_num_frames_slider, video_fps_slider,
                 video_quality_slider, include_geometry_checkbox, save_metadata_checkbox,
                 bake_resolution_slider, bake_nviews_slider, precision_radio,
-                isolate_jobs_checkbox,
+                isolate_jobs_checkbox, generate_mesh_checkbox,
             ],
             outputs=[batch_status, batch_log],
             show_progress="hidden",
@@ -3596,6 +3760,7 @@ def _background_preload():
 
 def main() -> None:
     write_builtin_presets()
+    sweep_job_tmp()
     startup_name, startup_why = startup_preset_name()
 
     banner(f"SECourses TRELLIS Studio {APP_VERSION}")
