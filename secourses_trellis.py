@@ -129,6 +129,21 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 # which we then upgrade to torch SDPA in Engine._patch_dinov2_attention().
 os.environ.setdefault("XFORMERS_DISABLED", "1")
 
+# Linux only, and a no-op everywhere else.  torch's Linux wheels do not bundle the CUDA
+# runtime the way the Windows ones bundle it in torch\lib, so cumm/spconv can die with
+# "libnvrtc-builtins.so.<major>.<minor>: cannot open shared object file".  Pre-loading
+# the libraries with RTLD_GLOBAL here fixes it for every extension imported later.
+# LD_LIBRARY_PATH is not an option: the loader reads it once, before Python starts.
+try:
+    import cuda_linux_deps                # noqa: E402  (APP_DIR is on sys.path above)
+except ImportError:                       # helper not shipped - carry on regardless
+    cuda_linux_deps = None
+else:
+    try:
+        cuda_linux_deps.preload()
+    except OSError:                       # never let library probing stop the app
+        pass
+
 import numpy as np                       # noqa: E402  (already loaded by gradio)
 import gradio as gr                      # noqa: E402
 from filelock import FileLock            # noqa: E402
@@ -906,6 +921,12 @@ class Engine:
         except BaseException as exc:                              # noqa: BLE001
             self.error = f"{type(exc).__name__}: {exc}"
             note(f"Engine failed to load: {self.error}", level="err")
+            # A missing CUDA .so is the one failure here with a one-command cure, so say
+            # so instead of leaving the user with a bare loader message.  Empty on
+            # Windows and for every other kind of error.
+            hint = cuda_linux_deps.missing_library_hint(str(exc)) if cuda_linux_deps else ""
+            if hint:
+                note(hint, level="err")
             traceback.print_exc()
             raise
         finally:
