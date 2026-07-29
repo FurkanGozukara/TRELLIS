@@ -216,9 +216,10 @@ def install_dependencies():
                 raise InstallationError(f"Required wheel file not found: {wheel}")
             run_command_with_retry(f"pip install {wheel}", f"Installing {name} from local wheel")
         
-        # Install Gradio last
+        # Install Gradio last. The app uses the built-in gr.Model3D, so the
+        # gradio_litmodel3d custom component is no longer needed.
         run_command_with_retry(
-            "pip install gradio==4.44.1 gradio_litmodel3d==0.0.1",
+            "pip install gradio==6.20.0",
             "Installing gradio for web app"
         )
         

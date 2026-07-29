@@ -18,6 +18,18 @@ from ..representations import Strivec, Gaussian, MeshExtractResult
 
 from api_spz.core.exceptions import CancelledException
 
+# nvdiffrast recommends reusing a single rasterizer context per process; creating one
+# per call (hole filling + texture baking + the final UV mask) costs time and GPU memory.
+_RASTCTX = None
+
+
+def _get_rastctx():
+    global _RASTCTX
+    if _RASTCTX is None:
+        _RASTCTX = utils3d.torch.RastContext(backend='cuda')
+    return _RASTCTX
+
+
 @torch.no_grad()
 def _fill_holes(
     verts,
@@ -27,7 +39,8 @@ def _fill_holes(
     resolution=128,
     num_views=500,
     debug=False,
-    verbose=False
+    verbose=False,
+    cancel_event=None,
 ):
     """
     Rasterize a mesh from multiple views and remove invisible faces.
@@ -55,21 +68,24 @@ def _fill_holes(
     radius = 2.0
     fov = torch.deg2rad(torch.tensor(40)).cuda()
     projection = utils3d.torch.perspective_from_fov_xy(fov, fov, 1, 3)
-    views = []
-    for (yaw, pitch) in zip(yaws, pitchs):
-        orig = torch.tensor([
-            torch.sin(yaw) * torch.cos(pitch),
-            torch.cos(yaw) * torch.cos(pitch),
-            torch.sin(pitch),
-        ]).cuda().float() * radius
-        view = utils3d.torch.view_look_at(orig, torch.tensor([0, 0, 0]).float().cuda(), torch.tensor([0, 0, 1]).float().cuda())
-        views.append(view)
-    views = torch.stack(views, dim=0)
+    # Build all camera origins in one shot instead of `num_views` tiny host<->device
+    # round-trips (identical maths, just vectorised).
+    origins = torch.stack([
+        torch.sin(yaws) * torch.cos(pitchs),
+        torch.cos(yaws) * torch.cos(pitchs),
+        torch.sin(pitchs),
+    ], dim=-1).float().cuda() * radius
+    _look_at_target = torch.zeros(3, dtype=torch.float32, device='cuda')
+    _look_at_up = torch.tensor([0, 0, 1], dtype=torch.float32, device='cuda')
+    views = torch.stack([utils3d.torch.view_look_at(origins[i], _look_at_target, _look_at_up)
+                         for i in range(origins.shape[0])], dim=0)
 
     # Rasterize
     visblity = torch.zeros(faces.shape[0], dtype=torch.int32, device=verts.device)
-    rastctx = utils3d.torch.RastContext(backend='cuda')
+    rastctx = _get_rastctx()
     for i in tqdm(range(views.shape[0]), total=views.shape[0], disable=not verbose, desc='Rasterizing'):
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledException("Cancelled while removing invisible faces.")
         view = views[i]
         buffers = utils3d.torch.rasterize_triangle_faces(
             rastctx, verts[None], faces, resolution, resolution, view=view, projection=projection
@@ -209,6 +225,7 @@ def postprocess_mesh(
     fill_holes_num_views: int = 1000,
     debug: bool = False,
     verbose: bool = False,
+    cancel_event=None,
 ):
     """
     Postprocess a mesh by simplifying, removing invisible faces, and removing isolated pieces.
@@ -250,6 +267,7 @@ def postprocess_mesh(
             num_views=fill_holes_num_views,
             debug=debug,
             verbose=verbose,
+            cancel_event=cancel_event,
         )
         vertices, faces = vertices.cpu().numpy(), faces.cpu().numpy()
         if verbose:
@@ -321,7 +339,7 @@ def bake_texture(
     if mode == 'fast':
         texture = torch.zeros((texture_size * texture_size, 3), dtype=torch.float32).cuda()
         texture_weights = torch.zeros((texture_size * texture_size), dtype=torch.float32).cuda()
-        rastctx = utils3d.torch.RastContext(backend='cuda')
+        rastctx = _get_rastctx()
         for observation, view, projection in tqdm(zip(observations, views, projections), total=len(observations), disable=not verbose, desc='Texture baking (fast)'):
             if cancel_event and cancel_event.is_set(): 
                 raise CancelledException(f"Cancelled the texture baking (fast).")
@@ -349,7 +367,7 @@ def bake_texture(
         texture = cv2.inpaint(texture, mask, 3, cv2.INPAINT_TELEA)
 
     elif mode == 'opt':
-        rastctx = utils3d.torch.RastContext(backend='cuda')
+        rastctx = _get_rastctx()
         observations = [observations.flip(0) for observations in observations]
         masks = [m.flip(0) for m in masks]
         _uv = []
@@ -446,13 +464,17 @@ def to_glb(
         fill_holes_num_views=1000,
         debug=debug,
         verbose=verbose,
+        cancel_event=cancel_event,
     )
 
     # parametrize mesh
+    if cancel_event is not None and cancel_event.is_set():
+        raise CancelledException("Cancelled before UV parametrization.")
     vertices, faces, uvs = parametrize_mesh(vertices, faces)
 
     # bake texture
-    observations, extrinsics, intrinsics = render_multiview(app_rep, resolution=1024, nviews=100)
+    observations, extrinsics, intrinsics = render_multiview(app_rep, resolution=1024, nviews=100,
+                                                            cancel_event=cancel_event)
     masks = [np.any(observation > 0, axis=-1) for observation in observations]
     extrinsics = [extrinsics[i].cpu().numpy() for i in range(len(extrinsics))]
     intrinsics = [intrinsics[i].cpu().numpy() for i in range(len(intrinsics))]

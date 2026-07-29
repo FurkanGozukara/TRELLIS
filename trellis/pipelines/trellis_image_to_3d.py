@@ -1,5 +1,6 @@
 from typing import *
 from contextlib import contextmanager
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -77,7 +78,18 @@ class TrellisImageTo3DPipeline(Pipeline):
         """
         Initialize the image conditioning model.
         """
-        dinov2_model = torch.hub.load('facebookresearch/dinov2', name, pretrained=True)
+        # Prefer the already-downloaded torch.hub checkout. `torch.hub.load('owner/repo', ...)`
+        # always resolves the default branch over the network first, which adds a few seconds
+        # to startup and fails outright when offline.
+        dinov2_model = None
+        local_repo = os.path.join(torch.hub.get_dir(), 'facebookresearch_dinov2_main')
+        if os.path.isfile(os.path.join(local_repo, 'hubconf.py')):
+            try:
+                dinov2_model = torch.hub.load(local_repo, name, source='local', pretrained=True)
+            except Exception as e:
+                logger.warning(f"Local dinov2 hub checkout failed ({e}); falling back to GitHub.")
+        if dinov2_model is None:
+            dinov2_model = torch.hub.load('facebookresearch/dinov2', name, pretrained=True)
         dinov2_model.eval()
         self.models['image_cond_model'] = dinov2_model
         transform = transforms.Compose([
@@ -257,6 +269,7 @@ class TrellisImageTo3DPipeline(Pipeline):
         cond: dict,
         coords: torch.Tensor,
         sampler_params: dict = {},
+        cancel_event=None,
     ) -> sp.SparseTensor:
         """
         Sample structured latent with the given conditioning.
@@ -279,7 +292,8 @@ class TrellisImageTo3DPipeline(Pipeline):
             noise,
             **cond,
             **sampler_params,
-            verbose=True
+            verbose=True,
+            cancel_event=cancel_event,
         ).samples
 
         std = torch.tensor(self.slat_normalization['std'])[None].to(slat.device)
@@ -320,12 +334,12 @@ class TrellisImageTo3DPipeline(Pipeline):
         torch.manual_seed(seed)
 
         self._move_models(['sparse_structure_flow_model', 'sparse_structure_decoder'], 'cuda', empty_cache=False) #load into gpu memory
-        coords = self.sample_sparse_structure(cond, num_samples, sparse_structure_sampler_params)
+        coords = self.sample_sparse_structure(cond, num_samples, sparse_structure_sampler_params, cancel_event=cancel_event)
         self._move_models(['sparse_structure_flow_model', 'sparse_structure_decoder'], 'cpu', empty_cache=True) #unload from gpu memory
         if cancel_event and cancel_event.is_set(): raise CancelledException(f"User Cancelled")
-        
+
         self._move_models(['slat_flow_model'], 'cuda', empty_cache=False) #unload from gpu memory
-        slat = self.sample_slat(cond, coords, slat_sampler_params)
+        slat = self.sample_slat(cond, coords, slat_sampler_params, cancel_event=cancel_event)
         self._move_models(['slat_flow_model'], 'cpu', empty_cache=True) #unload from gpu memory
 
         logger.info("Decoding the SLAT, please wait...")
@@ -425,7 +439,7 @@ class TrellisImageTo3DPipeline(Pipeline):
         ss_steps = {**self.sparse_structure_sampler_params, **sparse_structure_sampler_params}.get('steps')
         with self.inject_sampler_multi_image('sparse_structure_sampler', len(images), ss_steps, mode=mode):
             self._move_models(['sparse_structure_flow_model', 'sparse_structure_decoder'], 'cuda', empty_cache=False) #load into gpu memory
-            coords = self.sample_sparse_structure(cond, num_samples, sparse_structure_sampler_params)
+            coords = self.sample_sparse_structure(cond, num_samples, sparse_structure_sampler_params, cancel_event=cancel_event)
             self._move_models(['sparse_structure_flow_model', 'sparse_structure_decoder'], 'cpu', empty_cache=True) #unload from gpu memory
 
         slat_steps = {**self.slat_sampler_params, **slat_sampler_params}.get('steps')
@@ -433,7 +447,7 @@ class TrellisImageTo3DPipeline(Pipeline):
             if cancel_event and cancel_event.is_set(): raise CancelledException(f"User Cancelled")
 
             self._move_models(['slat_flow_model'], 'cuda', empty_cache=False) #unload from gpu memory
-            slat = self.sample_slat(cond, coords, slat_sampler_params)
+            slat = self.sample_slat(cond, coords, slat_sampler_params, cancel_event=cancel_event)
             self._move_models(['slat_flow_model'], 'cpu', empty_cache=True) #unload from gpu memory
 
         logger.info("Decoding the SLAT, please wait...")

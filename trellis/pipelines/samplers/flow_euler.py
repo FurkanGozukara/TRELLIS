@@ -53,17 +53,20 @@ class FlowEulerSampler(Sampler):
         t: float,
         t_prev: float,
         cond: Optional[Any] = None,
+        return_pred_x_0: bool = True,
         **kwargs
     ):
         """
         Sample x_{t-1} from the model using Euler method.
-        
+
         Args:
             model: The model to sample from.
             x_t: The [N x C x ...] tensor of noisy inputs at time t.
             t: The current timestep.
             t_prev: The previous timestep.
             cond: conditional information.
+            return_pred_x_0: if False, skip the extra x_0/eps reconstruction (it is
+                not needed for plain sampling and only wastes memory/compute).
             **kwargs: Additional arguments for model inference.
 
         Returns:
@@ -71,7 +74,11 @@ class FlowEulerSampler(Sampler):
             - 'pred_x_prev': x_{t-1}.
             - 'pred_x_0': a prediction of x_0.
         """
-        pred_x_0, pred_eps, pred_v = self._get_model_prediction(model, x_t, t, cond, **kwargs)
+        if return_pred_x_0:
+            pred_x_0, pred_eps, pred_v = self._get_model_prediction(model, x_t, t, cond, **kwargs)
+        else:
+            pred_x_0 = None
+            pred_v = self._inference_model(model, x_t, t, cond, **kwargs)
         pred_x_prev = x_t - (t - t_prev) * pred_v
         return edict({"pred_x_prev": pred_x_prev, "pred_x_0": pred_x_0})
 
@@ -85,11 +92,12 @@ class FlowEulerSampler(Sampler):
         rescale_t: float = 1.0,
         verbose: bool = True,
         cancel_event=None,
+        keep_intermediates: bool = False,
         **kwargs
     ):
         """
         Generate samples from the model using Euler method.
-        
+
         Args:
             model: The model to sample from.
             noise: The initial noise tensor.
@@ -97,13 +105,16 @@ class FlowEulerSampler(Sampler):
             steps: The number of steps to sample.
             rescale_t: The rescale factor for t.
             verbose: If True, show a progress bar.
+            keep_intermediates: If True, keep every intermediate x_t / x_0 tensor in the
+                returned dict. Defaults to False because nothing in the pipeline consumes
+                them and holding `steps * 2` tensors alive wastes a lot of VRAM.
             **kwargs: Additional arguments for model_inference.
 
         Returns:
             a dict containing the following
             - 'samples': the model samples.
-            - 'pred_x_t': a list of prediction of x_t.
-            - 'pred_x_0': a list of prediction of x_0.
+            - 'pred_x_t': a list of prediction of x_t (empty unless keep_intermediates).
+            - 'pred_x_0': a list of prediction of x_0 (empty unless keep_intermediates).
         """
         sample = noise
         t_seq = np.linspace(1, 0, steps + 1)
@@ -111,12 +122,14 @@ class FlowEulerSampler(Sampler):
         t_pairs = list((t_seq[i], t_seq[i + 1]) for i in range(steps))
         ret = edict({"samples": None, "pred_x_t": [], "pred_x_0": []})
         for t, t_prev in tqdm(t_pairs, desc="Sampling", disable=not verbose):
-            if cancel_event and cancel_event.is_set(): 
+            if cancel_event and cancel_event.is_set():
                 raise CancelledException(f"Cancelled the Sampling.")
-            out = self.sample_once(model, sample, t, t_prev, cond, **kwargs)
+            out = self.sample_once(model, sample, t, t_prev, cond,
+                                   return_pred_x_0=keep_intermediates, **kwargs)
             sample = out.pred_x_prev
-            ret.pred_x_t.append(out.pred_x_prev)
-            ret.pred_x_0.append(out.pred_x_0)
+            if keep_intermediates:
+                ret.pred_x_t.append(out.pred_x_prev)
+                ret.pred_x_0.append(out.pred_x_0)
         ret.samples = sample
         return ret
 

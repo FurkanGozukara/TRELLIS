@@ -45,9 +45,37 @@ def yaw_pitch_r_fov_to_extrinsics_intrinsics(yaws, pitchs, rs, fovs, dtype=torch
     return extrinsics, intrinsics
 
 
-def render_frames(sample, extrinsics, intrinsics, options={}, colors_overwrite=None, verbose=True, cancel_event=None, **kwargs):
+# Renderer instances are cached because MeshRenderer allocates an nvdiffrast
+# RasterizeCudaContext in its constructor; re-creating one for every video/multiview
+# render costs time and leaks GPU contexts. All rendering options are (re)assigned on
+# every call, so a cached instance behaves exactly like a fresh one.
+_RENDERER_CACHE = {}
+
+
+def _get_renderer(kind):
+    renderer = _RENDERER_CACHE.get(kind)
+    if renderer is None:
+        renderer = {'octree': OctreeRenderer, 'gaussian': GaussianRenderer, 'mesh': MeshRenderer}[kind]()
+        _RENDERER_CACHE[kind] = renderer
+    return renderer
+
+
+def render_frames(sample, extrinsics, intrinsics, options={}, colors_overwrite=None, verbose=True, cancel_event=None,
+                  frame_callback=None, **kwargs):
+    """
+    Render a list of camera poses.
+
+    Args:
+        frame_callback: optional ``fn(index, total)`` invoked after every rendered frame.
+        options['return_depth']: gaussian/octree only - also copy the depth buffer back to
+            the host. Off by default because nothing in TRELLIS consumes it and the
+            device->host copy is a large part of the per-frame cost.
+        options['mesh_return_types']: which buffers the mesh renderer should produce.
+            Defaults to ``['normal']`` - the only buffer used by the video/preview code.
+            Producing "mask"/"depth" as well triples the antialias work at ssaa=4.
+    """
     if isinstance(sample, Octree):
-        renderer = OctreeRenderer()
+        renderer = _get_renderer('octree')
         renderer.rendering_options.resolution = options.get('resolution', 512)
         renderer.rendering_options.near = options.get('near', 0.8)
         renderer.rendering_options.far = options.get('far', 1.6)
@@ -55,7 +83,7 @@ def render_frames(sample, extrinsics, intrinsics, options={}, colors_overwrite=N
         renderer.rendering_options.ssaa = options.get('ssaa', 4)
         renderer.pipe.primitive = sample.primitive
     elif isinstance(sample, Gaussian):
-        renderer = GaussianRenderer()
+        renderer = _get_renderer('gaussian')
         renderer.rendering_options.resolution = options.get('resolution', 512)
         renderer.rendering_options.near = options.get('near', 0.8)
         renderer.rendering_options.far = options.get('far', 1.6)
@@ -64,7 +92,7 @@ def render_frames(sample, extrinsics, intrinsics, options={}, colors_overwrite=N
         renderer.pipe.kernel_size = kwargs.get('kernel_size', 0.1)
         renderer.pipe.use_mip_gaussian = True
     elif isinstance(sample, MeshExtractResult):
-        renderer = MeshRenderer()
+        renderer = _get_renderer('mesh')
         renderer.rendering_options.resolution = options.get('resolution', 512)
         renderer.rendering_options.near = options.get('near', 1)
         renderer.rendering_options.far = options.get('far', 100)
@@ -72,35 +100,46 @@ def render_frames(sample, extrinsics, intrinsics, options={}, colors_overwrite=N
     else:
         raise ValueError(f'Unsupported sample type: {type(sample)}')
 
+    return_depth = options.get('return_depth', False)
+    mesh_return_types = options.get('mesh_return_types', ['normal'])
+    total = len(extrinsics) if hasattr(extrinsics, '__len__') else None
+
     rets = {}
-    for j, (extr, intr) in tqdm(enumerate(zip(extrinsics, intrinsics)), desc='Rendering', disable=not verbose):
-        
-        if cancel_event and cancel_event.is_set(): 
+    for j, (extr, intr) in tqdm(enumerate(zip(extrinsics, intrinsics)), desc='Rendering',
+                                total=total, disable=not verbose):
+
+        if cancel_event and cancel_event.is_set():
             raise CancelledException(f"User Cancelled")
-        
+
         if not isinstance(sample, MeshExtractResult):
             res = renderer.render(sample, extr, intr, colors_overwrite=colors_overwrite)
             if 'color' not in rets: rets['color'] = []
             if 'depth' not in rets: rets['depth'] = []
             rets['color'].append(np.clip(res['color'].detach().cpu().numpy().transpose(1, 2, 0) * 255, 0, 255).astype(np.uint8))
-            if 'percent_depth' in res:
-                rets['depth'].append(res['percent_depth'].detach().cpu().numpy())
-            elif 'depth' in res:
-                rets['depth'].append(res['depth'].detach().cpu().numpy())
-            else:
-                rets['depth'].append(None)
+            if return_depth:
+                if 'percent_depth' in res:
+                    rets['depth'].append(res['percent_depth'].detach().cpu().numpy())
+                elif 'depth' in res:
+                    rets['depth'].append(res['depth'].detach().cpu().numpy())
+                else:
+                    rets['depth'].append(None)
         else:
-            res = renderer.render(sample, extr, intr)
+            res = renderer.render(sample, extr, intr, return_types=mesh_return_types)
             if 'normal' not in rets: rets['normal'] = []
 
-            if torch.isnan(res['normal']).any() or torch.isinf(res['normal']).any():
-                res['normal'] = torch.nan_to_num(res['normal'], nan=0.0, posinf=0.0, neginf=0.0)
+            normal = res['normal']
+            if torch.isnan(normal).any() or torch.isinf(normal).any():
+                normal = torch.nan_to_num(normal, nan=0.0, posinf=0.0, neginf=0.0)
 
-            rets['normal'].append(np.clip(res['normal'].detach().cpu().numpy().transpose(1, 2, 0) * 255, 0, 255).astype(np.uint8))
+            rets['normal'].append(np.clip(normal.detach().cpu().numpy().transpose(1, 2, 0) * 255, 0, 255).astype(np.uint8))
+
+        if frame_callback is not None:
+            frame_callback(j + 1, total)
     return rets
 
 
-def render_video(sample, resolution=512, bg_color=(0, 0, 0), num_frames=30, r=2, fov=40, cancel_event=None, **kwargs):
+def render_video(sample, resolution=512, bg_color=(0, 0, 0), num_frames=30, r=2, fov=40, cancel_event=None,
+                 options=None, **kwargs):
     # Dynamically check for the dtype,  so that float16, float32 work:
     if hasattr(sample, 'vertices') and hasattr(sample.vertices, 'dtype'):
         dtype = sample.vertices.dtype
@@ -112,10 +151,13 @@ def render_video(sample, resolution=512, bg_color=(0, 0, 0), num_frames=30, r=2,
     yaws = yaws.tolist()
     pitch = pitch.tolist()
     extrinsics, intrinsics = yaw_pitch_r_fov_to_extrinsics_intrinsics(yaws, pitch, r, fov, dtype=dtype)
-    return render_frames(sample, extrinsics, intrinsics, {'resolution': resolution, 'bg_color': bg_color}, cancel_event=cancel_event, **kwargs)
+    render_options = {'resolution': resolution, 'bg_color': bg_color}
+    if options:
+        render_options.update(options)
+    return render_frames(sample, extrinsics, intrinsics, render_options, cancel_event=cancel_event, **kwargs)
 
 
-def render_multiview(sample, resolution=512, nviews=30, cancel_event=None):
+def render_multiview(sample, resolution=512, nviews=30, cancel_event=None, **kwargs):
     # Dynamically check for the dtype,  so that float16, float32 work:
     if hasattr(sample, 'vertices') and hasattr(sample.vertices, 'dtype'):
         dtype = sample.vertices.dtype
@@ -128,7 +170,8 @@ def render_multiview(sample, resolution=512, nviews=30, cancel_event=None):
     yaws = [cam[0] for cam in cams]
     pitchs = [cam[1] for cam in cams]
     extrinsics, intrinsics = yaw_pitch_r_fov_to_extrinsics_intrinsics(yaws, pitchs, r, fov, dtype=dtype)
-    res = render_frames(sample, extrinsics, intrinsics, {'resolution': resolution, 'bg_color': (0, 0, 0)}, cancel_event=cancel_event)
+    res = render_frames(sample, extrinsics, intrinsics, {'resolution': resolution, 'bg_color': (0, 0, 0)},
+                        cancel_event=cancel_event, **kwargs)
     return res['color'], extrinsics, intrinsics
 
 

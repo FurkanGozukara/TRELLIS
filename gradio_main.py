@@ -12,7 +12,7 @@ except ImportError:
 os.environ['SPCONV_ALGO'] = 'native' 
 
 import gradio as gr
-from gradio_litmodel3d import LitModel3D
+# gradio_litmodel3d is gone; Gradio 6 ships a capable gr.Model3D.
 
 import shutil
 from typing import *
@@ -326,7 +326,8 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
 
         with gr.Column():
             video_output = gr.Video(label="Generated 3D Asset", autoplay=True, loop=True, height=300)
-            model_output = LitModel3D(label="Extracted GLB/Gaussian", exposure=10.0, height=300)
+            model_output = gr.Model3D(label="Extracted GLB/Gaussian", height=300,
+                                      clear_color=(0.09, 0.10, 0.13, 1.0))
             
             with gr.Row():
                 download_glb = gr.DownloadButton(label="Download GLB", interactive=False)
