@@ -1,3 +1,7 @@
+# This repo is made for SECourses Premium App download and use from here : https://www.patreon.com/SECourses/posts/trellis-1-click-117470976
+
+## App download and installer here : https://www.patreon.com/SECourses/posts/trellis-1-click-117470976
+
 # SECourses TRELLIS Studio V10
 
 ## One-click image-to-3D AI generator for Windows, RunPod, SimplePod, Massed Compute, and Linux
