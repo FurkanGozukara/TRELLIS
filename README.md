@@ -7,6 +7,10 @@ Video tutorial : [https://youtu.be/EhU7Jil9WAk](https://youtu.be/EhU7Jil9WAk)
 -   We have TRELLIS 2 app too but since someone requested I updated this amazing app
     
     -   TRELLIS 2 : [https://www.patreon.com/SECourses/posts/trellis-2-app-1-147686623](https://www.patreon.com/SECourses/posts/trellis-2-app-1-147686623)
+
+
+https://github.com/user-attachments/assets/281714fb-a56b-4a3b-9568-e8b07271bca3
+
         
 ### 30 July 2026 V10 Update
 
