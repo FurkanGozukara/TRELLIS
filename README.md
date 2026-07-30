@@ -8,8 +8,6 @@ Video tutorial : [https://youtu.be/EhU7Jil9WAk](https://youtu.be/EhU7Jil9WAk)
     
     -   TRELLIS 2 : [https://www.patreon.com/SECourses/posts/trellis-2-app-1-147686623](https://www.patreon.com/SECourses/posts/trellis-2-app-1-147686623)
         
-<img width="1054" height="527" alt="image" src="https://github.com/user-attachments/assets/0720d649-af1b-4272-9d31-6694c963b7cd" />
-
 ### 30 July 2026 V10 Update
 
 -   We have completey remade the app and read below to understand how it works and full features
