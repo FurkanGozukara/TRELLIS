@@ -2,642 +2,191 @@
 
 ## App download and installer here : https://www.patreon.com/SECourses/posts/trellis-1-click-117470976
 
-# SECourses TRELLIS Studio V10
+Video tutorial : [https://youtu.be/EhU7Jil9WAk](https://youtu.be/EhU7Jil9WAk)
 
-## One-click image-to-3D AI generator for Windows, RunPod, SimplePod, Massed Compute, and Linux
-
-<p align="center">
-  <img src="assets/logo.webp" width="100%" alt="TRELLIS Structured 3D Latents">
-</p>
-
-<p align="center">
-  <a href="https://www.patreon.com/SECourses/posts/trellis-1-click-117470976"><strong>V10 installers, tutorials, screenshots, and downloads</strong></a>
-  ·
-  <a href="https://discord.com/servers/software-engineering-courses-secourses-772774097734074388">SECourses Discord</a>
-  ·
-  <a href="https://arxiv.org/abs/2412.01506">Research paper</a>
-  ·
-  <a href="https://trellis3d.github.io">Original project page</a>
-</p>
-
-<p align="center">
-  <img alt="Python 3.12" src="https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white">
-  <img alt="PyTorch 2.13" src="https://img.shields.io/badge/PyTorch-2.13-EE4C2C?logo=pytorch&logoColor=white">
-  <img alt="CUDA 13" src="https://img.shields.io/badge/CUDA-13-76B900?logo=nvidia&logoColor=white">
-  <img alt="Gradio 6.20" src="https://img.shields.io/badge/Gradio-6.20-FF7C00?logo=gradio&logoColor=white">
-  <img alt="Windows and Linux" src="https://img.shields.io/badge/Platforms-Windows%20%7C%20Linux-2563EB">
-</p>
-
-SECourses TRELLIS Studio V10 is a complete implementation of **TRELLIS: Structured 3D Latents for Scalable and Versatile 3D Generation**. It converts a single image or 2–4 views of the same object into:
-
-- A textured **GLB 3D mesh**
-- A **3D Gaussian splat PLY**
-- An **MP4 turntable preview**
-- Reproducible generation metadata
-
-V10 combines a modern Gradio interface with automatic background removal, multi-view image conditioning, low-VRAM presets, batch image-to-3D processing, resumable model downloads, and one-click installers for local and cloud NVIDIA GPUs.
-
-> [!IMPORTANT]
-> Download the current `trellis_v10.zip` installer bundle and read the platform-specific instructions on the [SECourses Patreon post](https://www.patreon.com/SECourses/posts/trellis-1-click-117470976). The installer bundle contains the pinned Torch 2.13/CUDA 13 dependency file, model downloader, and launch scripts described below.
-
-## V10 technology stack
-
-| Component | V10 version or implementation |
-|---|---|
-| Python | 3.12 |
-| PyTorch | 2.13.0 + CUDA 13.0 |
-| Torchvision | 0.28.0 + CUDA 13.0 |
-| Gradio | 6.20.0 |
-| 3D viewer | Native `gr.Model3D` |
-| Primary interface | `secourses_trellis.py` |
-| Image conditioner | DINOv2 ViT-L/14 with registers |
-| Background removal | rembg + U2NET |
-| Attention | FlashAttention, xFormers, SDPA, or naive |
-| Sparse backend | spconv |
-| Main outputs | Textured GLB, Gaussian PLY, MP4, metadata |
-
-The V10 installer provides precompiled Torch 2.13/CUDA 13 wheels for the performance-critical packages and TRELLIS CUDA extensions, including:
-
-- xFormers
-- FlashAttention
-- SageAttention
-- TorchAO
-- Triton for Windows
-- nvdiffrast
-- diff-gaussian-rasterization
-- vox2seq
-- diffoctreerast
-- Kaolin
-- spconv and cumm
-
-These extensions do not need to compile during a normal V10 installation.
-
-## Core single-image and multi-view image-to-3D features
-
-### Single image to 3D
-
-Upload or paste an object image, optionally remove the background, and generate a complete 3D asset. The input component accepts uploaded files and clipboard images.
-
-### Multi-image to 3D
-
-Provide 2–4 clean views of the **same object** and choose one of the supported multi-image algorithms:
-
-- `stochastic`
-- `multidiffusion`
-
-The interface includes bundled multi-view example sets. Multi-image conditioning is experimental; single-image mode will usually produce the sharpest result when the source image is already strong.
-
-### Two-stage TRELLIS generation controls
-
-The interface exposes both stages of the image-to-3D pipeline:
-
-1. **Sparse structure**
-   - Guidance strength
-   - Sampling steps
-2. **Structured latent**
-   - Guidance strength
-   - Sampling steps
-
-You can also use a fixed or randomized seed, repeat a generation any number of times, and reproduce previous assets from their saved metadata.
-
-### Automatic background removal
-
-The bundled U2NET/rembg workflow prepares images that do not already have a clean alpha channel. The app chooses the fastest available ONNX Runtime provider:
-
-1. CUDA
-2. DirectML
-3. CPU
-
-### Live progress, ETA, and cancellation
-
-Every long operation reports:
-
-- Current processing stage
-- Percentage and iteration progress
-- Iteration speed
-- Elapsed time
-- Estimated time remaining
-- VRAM status
-- Detailed browser and console logs
-
-Generation, extraction, and batch jobs can be cancelled without closing the interface.
-
-### Lazy engine loading
-
-The heavy PyTorch, CUDA, spconv, Kaolin, and TRELLIS modules are not loaded while the web interface starts. The engine loads on the first processing action, or it can be preloaded in the background with `--preload`.
-
-## Low-VRAM NVIDIA GPU presets
-
-TRELLIS Studio detects the active NVIDIA GPU and its VRAM with `nvidia-smi`, then automatically selects one of seven protected presets.
-
-| Preset | Precision | Mesh | Measured peak VRAM | Default video | Texture |
-|---|---:|:---:|---:|---:|---:|
-| 6 GB | fp16 | No | 5.1–5.5 GB | 512 px / 120 frames | 512 px |
-| 8 GB | fp16 | Yes | 7.6–8.1 GB | 512 px / 150 frames | 1024 px |
-| 10 GB | fp16 | Yes | 7.6–8.1 GB | 768 px / 180 frames | 1024 px |
-| 12 GB | fp16 | Yes | 7.6–8.1 GB | 1024 px / 240 frames | 1024 px |
-| 16 GB | fp32 | Yes | 12.1–12.9 GB | 1024 px / 240 frames | 1024 px |
-| 24 GB | fp32 | Yes | 12.1–12.9 GB | 1024 px / 300 frames | 2048 px |
-| 32 GB | fp32 | Yes | 12.1–12.9 GB | 1536 px / 360 frames | 2048 px |
-
-The measurements include real device occupancy, the CUDA context, allocator blocks, and driver overhead. The range represents a typical subject through a subject that fills more of the 3D volume.
-
-### How the 6 GB preset works
-
-The structured-latent mesh decoder is the largest allocation in the application. It needs approximately:
-
-- 7.6–8.1 GB in fp16
-- 12.1–12.9 GB in fp32
-
-The 6 GB preset skips mesh decoding and generates:
-
-- A Gaussian splat PLY
-- A color turntable video
-
-Because there is no decoded mesh, GLB export and the geometry preview pass are unavailable for that run.
-
-### Isolated job mode
-
-Low-VRAM presets can run each operation in a separate process. When the operation finishes, the process exits and releases the complete CUDA context rather than only cached tensors. This can recover approximately 1.2–1.7 GB between jobs and prevents a worker out-of-memory error from taking down the web interface.
-
-> [!CAUTION]
-> The bundled `Windows_Start.bat` currently uses `--highvram` for maximum speed. High-VRAM mode needs approximately 10 GB or more because it keeps the models on the GPU. On a smaller GPU, remove `--highvram` from the final launch command and select the matching 6 GB or 8 GB preset inside the interface.
-
-## Textured GLB, Gaussian PLY, and video outputs
-
-### MP4 turntable preview
-
-| Control | Range |
-|---|---:|
-| Resolution | 256–2048 px |
-| Frames | 30–480 |
-| Frame rate | 10–120 FPS |
-| Encoder quality | 1–10 |
-| Geometry pass | Optional |
-
-The preview can show color only or a side-by-side color and geometry/normal pass. Disabling the geometry pass makes preview rendering approximately twice as fast.
-
-Video files use H.264, YUV420p, and fast-start metadata for broad browser and media-player compatibility.
-
-### Textured GLB mesh export
-
-The GLB extraction pipeline:
-
-1. Simplifies the generated mesh
-2. Fills holes
-3. Unwraps UV coordinates
-4. Renders multiple texture-bake views
-5. Bakes the Gaussian appearance into a texture
-6. Exports a portable GLB asset
-
-| GLB control | Range |
-|---|---:|
-| Mesh simplification factor | 0.20–0.99 |
-| Texture size | 512, 1024, or 2048 px |
-| Texture-bake view size | 256–1024 px |
-| Texture-bake views | 20–200 |
-
-GLB extraction is normally the slowest step. Higher texture-bake resolution and more views improve coverage but increase processing time and VRAM use.
-
-### 3D Gaussian splat export
-
-The generated Gaussian representation can be saved as a `.ply` file and previewed in the native browser 3D viewer. Gaussian PLY files are commonly around 50 MB, so large assets may take a moment to appear.
-
-### Reproducible metadata
-
-Optional metadata is saved beside the generated outputs and records:
-
-- Application and code version
-- Seed
-- Single-image or multi-image mode
-- Sparse-structure guidance and steps
-- Structured-latent guidance and steps
-- Multi-image algorithm
-- Precision and attention backend
-- Video settings
-- Mesh vertex and triangle counts
-- Number of Gaussians
-- Generation duration
-- Output filename and timestamp
-
-## Batch image-to-3D processing
-
-The Batch tab can process an entire folder containing:
-
-- PNG
-- JPG or JPEG
-- WebP
-- BMP
-- TIF or TIFF
-
-Batch features include:
-
-- One or multiple generations per source image
-- Selectable MP4, GLB, and Gaussian PLY outputs
-- Reuse of every generation and extraction setting from the Generate tab
-- Natural filename sorting
-- Dedicated video, GLB, Gaussian, and metadata folders
-- Image counting before a run
-- Skip-existing support
-- Processed, skipped, and failed totals
-- Per-item timing, average speed, and ETA
-- Live logs and cancellation
-
-When **skip existing** is enabled, an image is skipped only when all outputs requested for that batch item already exist. This makes interrupted or incremental batch processing practical.
-
-## Preset system
-
-V10 stores every generation, video, extraction, precision, process-isolation, and batch option in presets.
-
-### Protected presets
-
-The built-in `Default` and seven VRAM presets live in:
-
-```text
-configs_trellis/presets_builtin/
-```
-
-They are regenerated from the source on every start and cannot be overwritten, deleted, or corrupted through the UI.
-
-### User presets
-
-Your custom presets live in:
-
-```text
-configs_trellis/presets_user/
-```
-
-The application never overwrites this folder. If a user preset was selected most recently, V10 restores it on the next start. Otherwise, the detected GPU determines the startup VRAM preset.
-
-## System and engine tools
-
-The System tab displays:
-
-- Application, Python, Torch, and platform versions
-- Active attention and sparse backends
-- Precision and high-VRAM status
-- Detected GPU and VRAM
-- Selected VRAM tier
-- Engine load state
-- Current and peak VRAM use
-- Output and preset paths
-
-It also provides controls to:
-
-- Load the engine immediately
-- Release cached VRAM
-- Refresh system information
-- Open the application folder
-
-## V10 one-click installer bundle
-
-The current installer ZIP is available from the [TRELLIS V10 Patreon post](https://www.patreon.com/SECourses/posts/trellis-1-click-117470976).
-
-| File | Purpose |
-|---|---|
-| `Windows_Install_Or_Update.bat` | Clone/update TRELLIS, create the Python 3.12 venv, install pinned packages, and download models |
-| `Windows_Start.bat` | Activate the environment and launch TRELLIS Studio |
-| `Windows_Download_Resume_Models.bat` | Resume and verify model downloads without reinstalling |
-| `RunPod_Trellis_Install.sh` | Install on RunPod or SimplePod |
-| `Massed_Compute_Install.sh` | Install on Massed Compute |
-| `DownloadModels.py` | Resumable, multi-connection, SHA256-verified model downloader |
-| `requirements_trellis.txt` | Pinned Torch 2.13/CUDA 13 dependencies and precompiled wheels |
-| `RunPod_SimplePod_Instructions_READ.txt` | RunPod and SimplePod setup/start instructions |
-| `Massed_Compute_Instructions_READ.txt` | Massed Compute setup/start instructions |
-| `Pip_Freeze.txt` | Reference V10 Windows environment |
-
-Keep `requirements_trellis.txt` and `DownloadModels.py` beside the matching installer script.
-
-## Requirements and compatibility
-
-### NVIDIA GPU
-
-CUDA 13 requires:
-
-- NVIDIA driver **580 or newer**
-- Compute capability **sm_75 or newer**
-
-Supported architecture families include compatible:
-
-- Turing
-- Ampere
-- Ada
-- Hopper
-- Blackwell
-
-In consumer GPU terms, use an RTX 20, 30, 40, or 50 series GPU or newer compatible hardware. More VRAM enables fp32, higher sampling steps, denser meshes, larger previews, and higher-resolution textures.
-
-### Windows requirements
-
-- Python 3.12.10
-- Git with Git LFS
-- FFmpeg
-- CUDA 13
-- cuDNN 9.17 or newer
-- Visual Studio Community with the C++ workload and options
-- Current NVIDIA driver
-
-Follow the requirements video and written tutorial linked in the [Patreon post](https://www.patreon.com/SECourses/posts/trellis-1-click-117470976) before running the installer.
-
-### Folder requirements
-
-- Extract V10 into a fresh folder.
-- Use a short, normal path.
-- Avoid spaces and special characters in installer paths.
-- Do not install from OneDrive, Dropbox, Google Drive, or another synchronization folder.
-- Keep all installer-bundle files together.
-
-## Quick start: Windows
-
-1. Install the Windows requirements.
-2. Download `trellis_v10.zip` from the [V10 post](https://www.patreon.com/SECourses/posts/trellis-1-click-117470976).
-3. Extract the ZIP into a new local folder.
-4. Run:
-
-   ```text
-   Windows_Install_Or_Update.bat
-   ```
-
-5. Wait for dependencies and all models to finish downloading.
-6. Start the application with:
-
-   ```text
-   Windows_Start.bat
-   ```
-
-If a model download is interrupted, run:
-
-```text
-Windows_Download_Resume_Models.bat
-```
-
-The resume script installs nothing. It verifies completed files, skips valid files, and continues partial downloads.
-
-## Quick start: RunPod and SimplePod
-
-Use the recommended CUDA 13 template and persistent storage described in `RunPod_SimplePod_Instructions_READ.txt`.
-
-Place the extracted installer files in `/workspace`, then run:
-
-```bash
-cd /workspace
-export HF_HOME="/workspace"
-export TORCH_HOME="/workspace/torch"
-export U2NET_HOME="/workspace/u2net"
-export UV_CONCURRENT_INSTALLS=4
-chmod +x RunPod_Trellis_Install.sh
-./RunPod_Trellis_Install.sh
-```
-
-Start the application in a new terminal:
-
-```bash
-unset LD_LIBRARY_PATH
-cd /workspace/TRELLIS
-export HF_HOME="/workspace"
-export TORCH_HOME="/workspace/torch"
-export U2NET_HOME="/workspace/u2net"
-export PYTHONWARNINGS=ignore
-export HF_HUB_ENABLE_HF_TRANSFER=0
-export CUDA_VISIBLE_DEVICES=0
-source ./venv/bin/activate
-python secourses_trellis.py --share --highvram
-```
-
-Use the same `HF_HOME`, `TORCH_HOME`, and `U2NET_HOME` values on every start. Otherwise, DINOv2 or U2NET may download again outside the persistent volume.
-
-Remove `--highvram` when using a GPU that does not have enough VRAM to keep the complete model stack resident.
-
-## Quick start: Massed Compute
-
-Extract the V10 installer bundle into a normal folder outside any synchronized directory:
-
-```bash
-chmod +x Massed_Compute_Install.sh
-./Massed_Compute_Install.sh
-```
-
-The installer:
-
-- Reuses a compatible Python 3.12 environment when available
-- Installs a stable Python 3.12 build when required
-- Falls back to a uv-managed Python 3.12 build when needed
-- Creates the virtual environment
-- Installs the pinned CUDA stack
-- Downloads and verifies every model
-- Installs FFmpeg and FFprobe
-
-Start the application:
-
-```bash
-cd TRELLIS
-export PYTHONWARNINGS=ignore
-export HF_HUB_ENABLE_HF_TRANSFER=0
-export CUDA_VISIBLE_DEVICES=0
-source ./venv/bin/activate
-python3 secourses_trellis.py --share --highvram
-```
-
-## Resumable model downloader
-
-`DownloadModels.py` replaces a basic snapshot download with a robust cross-platform downloader.
-
-### Download behavior
-
-- Up to 16 parallel connections
-- Byte-range resume
-- Automatic retries and exponential backoff
-- File-size checks
-- SHA256 verification
-- Verified-file cache
-- Safe repeated execution
-- Hugging Face token support
-- Separate third-party download session so a Hugging Face token is not sent to other hosts
-
-### Models downloaded
-
-| Model | Approximate size | Destination |
-|---|---:|---|
-| TRELLIS checkpoints | 4 GB | `TRELLIS/models/` |
-| DINOv2 ViT-L/14 with registers | 1.2 GB | `TORCH_HOME/hub/checkpoints/` |
-| U2NET background-removal model | 176 MB | `U2NET_HOME/` |
-
-Pre-downloading DINOv2 and U2NET prevents the first generation from pausing for another large download inside the web interface.
-
-### Downloader commands
-
-Run from the V10 installer directory with the TRELLIS virtual environment active:
-
-```bash
-python DownloadModels.py
-python DownloadModels.py --model trellis
-python DownloadModels.py --model dinov2 rembg
-python DownloadModels.py --all
-python DownloadModels.py --list
-python DownloadModels.py --dry-run
-```
-
-If a transfer fails, run the same command again. Completed files are skipped and partial files resume.
-
-## Using TRELLIS Studio V10
-
-1. Start `secourses_trellis.py`.
-2. Confirm that the automatically selected VRAM tier matches the active GPU.
-3. Upload one image or switch to the multi-image tab and provide 2–4 views.
-4. Use **Remove background & preview** when the source is not already a clean cutout.
-5. Choose a random or fixed seed.
-6. Adjust sparse-structure and structured-latent settings if needed.
-7. Select:
-   - **Generate preview video** for a fast first look, or
-   - **Generate + extract everything** for MP4, GLB, and PLY outputs.
-8. Download the assets from the interface or open the output folder.
-
-### Quality guidance
-
-| Goal | Suggested change |
-|---|---|
-| Sharper geometry | Use 20–25 sparse-structure sampling steps |
-| Cleaner texture | Use a 2048 px texture and a lower simplification value such as 0.7–0.8 |
-| Faster iteration | Use 10–12 steps, 512 px / 120-frame video, and disable the geometry pass |
-| Lower VRAM | Use fp16; disable mesh generation when necessary |
-| Reproducible assets | Disable random seed and keep the generated metadata |
-
-## Command-line options
-
-```text
---precision fp32|fp16
---attention flash_attn|xformers|sdpa|naive
---xformers
---share
---highvram
---preload
---no-tf32
---no-browser
---port PORT
---listen
-```
-
-| Option | Description |
-|---|---|
-| `--precision` | Select fp32 or lower-VRAM fp16 model weights |
-| `--attention` | Force an attention backend |
-| `--xformers` | Shortcut for `--attention xformers` |
-| `--share` | Create a public Gradio share URL |
-| `--highvram` | Keep every model resident on the GPU for maximum speed |
-| `--preload` | Load the engine in the background immediately after UI startup |
-| `--no-tf32` | Disable TF32 matrix multiplication |
-| `--no-browser` | Do not open a local browser automatically |
-| `--port` | Select the Gradio server port |
-| `--listen` | Bind to `0.0.0.0` for LAN or remote access |
-
-Without an explicit attention option, V10 uses:
-
-1. FlashAttention when available
-2. xFormers when FlashAttention is unavailable
-3. PyTorch SDPA as the next fallback
-
-## Output folders
-
-```text
-TRELLIS/
-├── outputs_trellis/
-│   ├── video/
-│   ├── glb/
-│   ├── gaussian/
-│   └── metadata/
-├── batch_input_images/
-├── batch_outputs_trellis/
-│   ├── video/
-│   ├── glb/
-│   ├── gaussian/
-│   └── metadata/
-├── configs_trellis/
-│   ├── presets_builtin/
-│   └── presets_user/
-└── tmp/
-    └── jobs/
-```
-
-Output filenames are reserved with a file lock and a collision-safe numeric sequence. Multi-generation runs receive an additional per-generation suffix.
-
-## Python examples
-
-The repository includes:
-
-- [`example.py`](example.py) for single-image generation
-- [`example_multi_image.py`](example_multi_image.py) for multi-view generation
-- [`app.py`](app.py) for the original lightweight Gradio demo
-- [`api_spz/main_api.py`](api_spz/main_api.py) for FastAPI integration
-
-The full V10 Studio interface is:
-
-```bash
-python secourses_trellis.py
-```
-
-After the V10 installer has placed the models in `TRELLIS/models`, custom code can load the local pipeline with:
-
-```python
-from trellis.pipelines import TrellisImageTo3DPipeline
-
-pipeline = TrellisImageTo3DPipeline.from_pretrained("models")
-```
-
-Refer to the bundled examples for complete rendering, GLB export, PLY export, and multi-image calls.
-
-## Upstream TRELLIS project
-
-<p align="center">
-  <img src="assets/teaser.png" width="100%" alt="TRELLIS generated 3D assets">
-</p>
-
-TRELLIS is a large 3D asset generation model. Its unified Structured LATent (SLAT) representation can decode into multiple 3D formats, including Radiance Fields, 3D Gaussians, and meshes. Rectified Flow Transformers provide the generative backbones.
-
-The upstream project provides pretrained models with up to two billion parameters, trained on a large dataset of 500,000 diverse 3D objects.
-
-### Upstream resources
-
-- [TRELLIS paper](https://arxiv.org/abs/2412.01506)
-- [TRELLIS project page](https://trellis3d.github.io)
-- [Original Microsoft TRELLIS repository](https://github.com/microsoft/TRELLIS)
-- [Original Hugging Face demo](https://huggingface.co/spaces/JeffreyXiang/TRELLIS)
-- [TRELLIS-image-large model](https://huggingface.co/JeffreyXiang/TRELLIS-image-large)
-
-## Dataset
-
-TRELLIS-500K contains 500,000 3D assets curated from:
-
-- [Objaverse XL](https://objaverse.allenai.org/)
-- [Amazon Berkeley Objects](https://amazon-berkeley-objects.s3.amazonaws.com/index.html)
-- [3D-FUTURE](https://tianchi.aliyun.com/specials/promotion/alibaba-3d-future)
-- [HSSD](https://huggingface.co/datasets/hssd/hssd-models)
-- [Toys4K](https://github.com/rehg-lab/lowshot-shapebias/tree/main/toys4k)
-
-See [`DATASET.md`](DATASET.md) for dataset and preprocessing details.
-
-## License
-
-TRELLIS models and the majority of the code are released under the [`LICENSE`](LICENSE) included in this repository. Individual submodules and third-party dependencies may use different licenses.
-
-Review the licenses of all models, submodules, and dependencies before commercial use or redistribution.
-
-## Citation
-
-If you use TRELLIS in academic work, cite the original paper:
-
-```bibtex
-@article{xiang2024structured,
-    title   = {Structured 3D Latents for Scalable and Versatile 3D Generation},
-    author  = {Xiang, Jianfeng and Lv, Zelong and Xu, Sicheng and Deng, Yu and Wang, Ruicheng and Zhang, Bowen and Chen, Dong and Tong, Xin and Yang, Jiaolong},
-    journal = {arXiv preprint arXiv:2412.01506},
-    year    = {2024}
-}
-```
-
-## Support and updates
-
-- [TRELLIS V10 Patreon post](https://www.patreon.com/SECourses/posts/trellis-1-click-117470976)
-- [SECourses Discord](https://discord.com/servers/software-engineering-courses-secourses-772774097734074388)
-- [SECourses Stable Diffusion and Generative AI repository](https://github.com/FurkanGozukara/Stable-Diffusion)
-- [Patreon posts and scripts index](https://github.com/FurkanGozukara/Stable-Diffusion/blob/main/Patreon-Posts-Index.md)
-
+-   We have TRELLIS 2 app too but since someone requested I updated this amazing app
+    
+    -   TRELLIS 2 : [https://www.patreon.com/SECourses/posts/trellis-2-app-1-147686623](https://www.patreon.com/SECourses/posts/trellis-2-app-1-147686623)
+        
+
+![](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/KbSeY27k44sswbu4HzTqN.gif)
+
+### 30 July 2026 V10 Update
+
+-   We have completey remade the app and read below to understand how it works and full features
+    
+-   Make a fresh install and read the below carefully please
+    
+-   We use latest pre-compiled wheels and Torch 2.13 and CUDA 13
+    
+
+### Windows Requirements
+
+-   Python 3.12.10, FFmpeg, CUDA 13, cuDNN 9.17 or above, Visual Studio Community Edition with all C++ options selected
+    
+    -   Don't worry CUDA 13 works with all GPUs - make sure you have updated NVIDIA driver
+        
+    -   Follow this requirements tutorial video exactly : [https://youtu.be/DrhUHnYfwC0](https://youtu.be/DrhUHnYfwC0)
+        
+    -   Follow its updated post with links and screenshots exactly : [https://www.patreon.com/SECourses/posts/requirements-written-tutorial-111553210](https://www.patreon.com/SECourses/posts/requirements-written-tutorial-111553210)
+        
+
+### RunPod, SimplePod, Massed Compute and Linux Users
+
+-   RunPod and SimplePod please follow : RunPod\_SimplePod\_Instructions\_READ.txt
+    
+    -   [https://get.runpod.io/955rkuppqv4h](https://get.runpod.io/955rkuppqv4h)
+        
+    -   [https://simplepod.ai/ref?user=secourses](https://simplepod.ai/ref?user=secourses)
+        
+-   Massed Compute and Local Linux please follow : Massed\_Compute\_Instructions\_READ.txt
+    
+    -   [https://vm.massedcompute.com/signup?linkId=lp\_034338&sourceId=secourses&tenantId=massed-compute](https://vm.massedcompute.com/signup?linkId=lp_034338&sourceId=secourses&tenantId=massed-compute)
+        
+
+### TRELLIS 1 FEATURES
+
+-   1-Click installers with following pre-compiled wheels for both Windows and Linux
+    
+
+![](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/kaKBoGlFTxhO4gTfbPLm6.png)
+
+![](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/W4oGS4-Xfui_pm_pzoQQb.png)
+
+-   Modern Torch 2.13 and CUDA 13 installation with Python 3.12 VENV
+    
+-   Latest version modern looking Gradio 6.20.0 interface
+    
+-   Fully working fully optimized very best configuration set TRELLIS 1 app
+    
+-   Click to see full size screenshot and all features below
+    
+
+![](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/YWyhIAB1fzS9H8vlvMEIE.png)
+
+Supporting multiple image input for better quality generation see below image
+
+![](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/2pZyJ29bibUKajWehp3wM.png)
+
+Fully supported batch folder processing
+
+![](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/iQGYuTiGu0RqnvNMmfYod.png)
+
+Fully supported preset system
+
+![](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/y4g_FoiUs8cWdygnqmgye.png)
+
+### TRELLIS V10 Image-to-3D AI Generator – Complete Features
+
+SECourses TRELLIS Studio V10 is a one-click implementation of TRELLIS: Structured 3D Latents for Scalable and Versatile 3D Generation for Windows, RunPod, SimplePod, Massed Compute, and Linux. This AI 3D model generator converts a single image or 2–4 multi-view images of the same object into a textured GLB mesh, a 3D Gaussian splat PLY file, and an MP4 turntable preview. V10 uses Python 3.12, PyTorch 2.13.0, CUDA 13, torchvision 0.28.0, and Gradio 6.20.0.
+
+### Core Single-Image and Multi-View Image-to-3D Features
+
+-   Single image to 3D: upload or paste an object image, optionally remove its background, and generate a complete 3D asset.
+    
+-   Multi-image to 3D: provide 2–4 clean views of the same object and choose the stochastic or multidiffusion algorithm. Built-in multi-view example sets are included. Multi-image mode is experimental; single-image mode is usually sharper.
+    
+-   Two-stage generation controls: separately control sparse-structure guidance and sampling steps, structured-latent guidance and sampling steps, random or fixed seeds, and any number of repeated generations.
+    
+-   Automatic background removal: the bundled U2NET/rembg workflow prepares images without an alpha channel and automatically uses CUDA, DirectML, or CPU when available.
+    
+-   Fast workflow buttons: generate only the preview first, or use “Generate + extract everything” to create the preview video, textured GLB mesh, and Gaussian splat in one run.
+    
+-   Live progress and cancellation: every long operation reports the current stage, percentage, iteration speed, elapsed time, ETA, VRAM status, and a live log in both the browser and console. Generation and batch jobs can be cancelled.
+    
+-   Modern native 3D preview: V10 uses the built-in Gradio Model3D viewer for GLB and PLY previews, with direct download buttons and no custom viewer component.
+    
+
+### Low-VRAM NVIDIA GPU Presets and Performance
+
+-   The app detects the NVIDIA GPU and VRAM with nvidia-smi, then automatically selects one of seven protected presets: 6, 8, 10, 12, 16, 24, or 32 GB. Each preset changes precision, sampling steps, video quality, texture quality, bake settings, mesh generation, and process isolation together.
+    
+-   6 GB preset: approximately 5.1–5.5 GB measured peak VRAM in fp16. It produces the Gaussian splat and turntable video but skips mesh decoding, so GLB export is unavailable.
+    
+-   8–12 GB presets: approximately 7.6–8.1 GB measured peak VRAM in fp16 with the mesh and Gaussian enabled. The 10 GB tier adds the geometry pass; the 12 GB tier uses a 1024 px, 240-frame preview by default.
+    
+-   16–32 GB presets: approximately 12.1–12.9 GB measured peak VRAM in fp32, with progressively higher sampling, video, mesh, and texture quality.
+    
+-   Isolated job mode runs each task in its own process so the CUDA context is fully released afterward. This can recover roughly 1.2–1.7 GB between runs and protects the web interface if a worker runs out of memory.
+    
+-   FlashAttention, xFormers, SDPA, and naive attention backends are supported. The app automatically chooses the best installed backend, enables TF32 on supported NVIDIA GPUs, and includes a dedicated high-VRAM mode for maximum speed.
+    
+
+Important low-VRAM Windows note: the bundled Windows\_Start.bat currently launches with the --highvram flag, which is the fastest mode and needs about 10 GB of VRAM. If your GPU has less VRAM, remove --highvram from the final launch command and then select the matching 6 GB or 8 GB preset inside the app.
+
+### Textured GLB, Gaussian Splat PLY, and Video Outputs
+
+-   MP4 turntable preview: adjustable 256–2048 px resolution, 30–480 frames, 10–120 FPS, encoder quality 1–10, and an optional side-by-side geometry/normal pass. Disabling the geometry pass makes preview rendering about twice as fast.
+    
+-   Textured GLB mesh export: the extraction pipeline simplifies the mesh, fills holes, unwraps UVs, and bakes the Gaussian appearance into a texture. Controls include a 0.20–0.99 simplification factor, 512/1024/2048 px textures, 256–1024 px bake views, and 20–200 texture-bake views.
+    
+-   3D Gaussian splat export: save the generated Gaussian representation as a PLY file and preview it directly in the browser. PLY files are commonly around 50 MB, so the viewer can take a moment to display them.
+    
+-   Reproducible metadata: optional TXT/JSON metadata records the seed, stage guidance and steps, precision, attention backend, input mode, video settings, mesh vertex/triangle counts, number of Gaussians, timing, and output filename.
+    
+-   Outputs are organized automatically into separate video, GLB, Gaussian, and metadata folders with collision-safe numeric filenames.
+    
+
+### Batch Image-to-3D Processing
+
+-   Process an entire folder of PNG, JPG, JPEG, WebP, BMP, TIF, or TIFF images.
+    
+-   Create one or multiple generations per image and choose any combination of MP4 preview, textured GLB mesh, and Gaussian PLY output.
+    
+-   Reuse every generation, video, extraction, precision, and VRAM setting from the Generate tab.
+    
+-   Resume practical batch work with “skip existing”: an image is skipped when all requested output files already exist.
+    
+-   Natural filename sorting, dedicated output subfolders, image counting, processed/skipped/failed totals, per-item timing, average speed, ETA, live logs, and batch cancellation are included.
+    
+
+### One-Click Installers and Resumable Model Downloads
+
+-   Windows\_Install\_Or\_Update.bat clones or updates the SECourses TRELLIS repository and submodules, creates a Python 3.12 virtual environment, installs the pinned dependencies with uv, and downloads every required model automatically.
+    
+-   RunPod\_Trellis\_Install.sh supports RunPod and SimplePod with a managed Python 3.12 environment, persistent Hugging Face/Torch/U2NET caches, pinned packages, automatic model downloads, and a bundled Linux FFmpeg/FFprobe installation.
+    
+-   Massed\_Compute\_Install.sh installs or reuses a stable Python 3.12 environment, falls back to uv-managed Python when needed, installs the CUDA stack, downloads the models, and installs FFmpeg.
+    
+-   Precompiled Torch 2.13/CUDA 13 wheels are supplied for xFormers, FlashAttention, SageAttention, TorchAO, nvdiffrast, diff-gaussian-rasterization, vox2seq, diffoctreerast, Kaolin, spconv, and cumm. The TRELLIS CUDA extensions do not need to compile during installation.
+    
+-   The custom model downloader uses up to 16 connections, automatic retry and backoff, byte-range resume, file-size checks, and SHA256 verification. Verified files are skipped safely, so interrupted downloads continue instead of restarting.
+    
+-   The installer pre-downloads roughly 4 GB of TRELLIS checkpoints, the 1.2 GB DINOv2 ViT-L/14 image conditioner, and the 176 MB U2NET background-removal model so the first generation does not stop for another large download.
+    
+-   Windows\_Download\_Resume\_Models.bat only resumes/verifies model files; it does not reinstall the application. It is safe to run repeatedly.
+    
+
+### Compatibility and Installation Notes
+
+-   Windows requirements: Python 3.12.10, Git with Git LFS, FFmpeg, CUDA 13, cuDNN 9.17 or newer, Visual Studio Community with the C++ workload/options, and an up-to-date NVIDIA driver.
+    
+-   CUDA 13 compatibility: use NVIDIA driver 580 or newer and a GPU with compute capability sm\_75 or newer—RTX 20, 30, 40, and 50 series plus compatible Turing, Ampere, Ada, Hopper, and Blackwell GPUs.
+    
+-   Keep the ZIP files together: requirements\_trellis.txt and DownloadModels.py must remain beside the matching installer script. Use a short normal folder path, avoid spaces/special characters, and do not install from a cloud-synchronization folder.
+    
+-   For RunPod and SimplePod, extract the files in /workspace and use persistent storage plus the same HF\_HOME, TORCH\_HOME, and U2NET\_HOME values on every start, otherwise large models may download again.
+    
+-   Make a fresh V10 installation. If a cloud storage error corrupts the virtual environment, remove only the TRELLIS venv and rerun the installer; completed model files will be verified and skipped.
+    
+
+### Recommended TRELLIS V10 Workflow
+
+1.  Extract the latest trellis\_v10.zip into a new folder and follow the requirements tutorial linked above.
+    
+2.  Run the installer for Windows, RunPod/SimplePod, or Massed Compute and allow the automatic model verification/download to finish.
+    
+3.  If a download is interrupted, rerun the installer or use Windows\_Download\_Resume\_Models.bat; completed files are skipped and partial files resume.
+    
+4.  Start SECourses TRELLIS Studio, confirm the automatically selected VRAM preset, and lower the tier if another GPU application is using VRAM.
+    
+5.  Use a clean object image with clear separation from the background, or provide 2–4 consistent views of the same object. Generate a preview first, then extract GLB/PLY—or use “Generate + extract everything.”
+    
+6.  For reproducible AI 3D assets, disable random seed and save the metadata file. For sharper geometry, try 20–25 sampling steps; for cleaner textures, use 2048 px texture size when VRAM allows.
+    
+
+In short: TRELLIS Studio V10 is a complete single-image and multi-view image-to-3D workflow with one-click Windows and cloud installers, low-VRAM presets, batch 3D asset generation, textured GLB export, 3D Gaussian splat PLY export, automatic background removal, resumable verified model downloads, and a modern Gradio interface
+
+System info
+
+![](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/aF0V3-p2Uyx2V9IGAvgIA.png)
