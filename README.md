@@ -8,8 +8,7 @@ Video tutorial : [https://youtu.be/EhU7Jil9WAk](https://youtu.be/EhU7Jil9WAk)
     
     -   TRELLIS 2 : [https://www.patreon.com/SECourses/posts/trellis-2-app-1-147686623](https://www.patreon.com/SECourses/posts/trellis-2-app-1-147686623)
         
-
-![](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/KbSeY27k44sswbu4HzTqN.gif)
+<img width="1054" height="527" alt="image" src="https://github.com/user-attachments/assets/0720d649-af1b-4272-9d31-6694c963b7cd" />
 
 ### 30 July 2026 V10 Update
 
@@ -48,10 +47,9 @@ Video tutorial : [https://youtu.be/EhU7Jil9WAk](https://youtu.be/EhU7Jil9WAk)
 
 -   1-Click installers with following pre-compiled wheels for both Windows and Linux
     
+<img width="1714" height="1333" alt="image" src="https://github.com/user-attachments/assets/0819eaf9-1763-4630-9bbc-c69c152637a5" />
 
-![](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/kaKBoGlFTxhO4gTfbPLm6.png)
-
-![](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/W4oGS4-Xfui_pm_pzoQQb.png)
+<img width="2173" height="1000" alt="image" src="https://github.com/user-attachments/assets/49737ba1-a015-4f9d-a055-62304d3a1954" />
 
 -   Modern Torch 2.13 and CUDA 13 installation with Python 3.12 VENV
     
@@ -61,20 +59,20 @@ Video tutorial : [https://youtu.be/EhU7Jil9WAk](https://youtu.be/EhU7Jil9WAk)
     
 -   Click to see full size screenshot and all features below
     
-
-![](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/YWyhIAB1fzS9H8vlvMEIE.png)
+<img width="3842" height="6072" alt="image" src="https://github.com/user-attachments/assets/4b223c65-9134-459f-9835-2bacea90f1dc" />
 
 Supporting multiple image input for better quality generation see below image
 
-![](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/2pZyJ29bibUKajWehp3wM.png)
+<img width="3842" height="6406" alt="image" src="https://github.com/user-attachments/assets/53cea5db-b0f2-4788-8954-9293a4af8a10" />
 
 Fully supported batch folder processing
 
-![](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/iQGYuTiGu0RqnvNMmfYod.png)
+<img width="3840" height="2420" alt="image" src="https://github.com/user-attachments/assets/93ae1e39-3eb1-4437-af60-15d4adccfe3a" />
 
 Fully supported preset system
 
-![](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/y4g_FoiUs8cWdygnqmgye.png)
+<img width="3840" height="2719" alt="image" src="https://github.com/user-attachments/assets/7be4764a-f2f5-43ce-bbca-e2ce6e476b24" />
+
 
 ### TRELLIS V10 Image-to-3D AI Generator – Complete Features
 
@@ -189,4 +187,6 @@ In short: TRELLIS Studio V10 is a complete single-image and multi-view image-to-
 
 System info
 
-![](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/aF0V3-p2Uyx2V9IGAvgIA.png)
+<img width="3840" height="3212" alt="image" src="https://github.com/user-attachments/assets/c58891a5-c99b-4ad3-9e96-c73f799d5d68" />
+
+
